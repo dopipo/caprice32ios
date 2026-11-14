@@ -3743,6 +3743,12 @@ jobs:
             echo "USERINCLUDE     ../sdl"
             echo "USERINCLUDE     ../inc"
             echo "USERINCLUDE     ../stage"
+            # abld compiles with -I-, so <...> includes are searched in SYSTEMINCLUDE only. The freestanding
+            # compat runtime (<string>, <vector>, <sys/stat.h>, ...) must be there, ahead of anything the SDK adds.
+            echo "SYSTEMINCLUDE   ../compat"
+            echo "SYSTEMINCLUDE   ../sdl"
+            echo "SYSTEMINCLUDE   ../inc"
+            echo "SYSTEMINCLUDE   ../stage"
             echo "SOURCEPATH      ../stage"
             for f in "$S"/*.cpp; do echo "SOURCE          $(basename "$f")"; done
             echo "SOURCEPATH      ../compat"
@@ -3860,11 +3866,30 @@ jobs:
           grep -n 'CPP_LANG_OPTION' "$GCCEMK"
           /usr/bin/perl -pi -e 's/-std=gnu\+\+98/-std=gnu++17/' "$GCCEMK"
           grep -q 'gnu++17' "$GCCEMK" || { echo "could not switch gcce.mk to gnu++17"; exit 1; }
+          # gcce.h force-includes <symcpp.h> (-include gcce.h) into every translation unit.  Make it resolvable:
+          # use the SDK's copy (its directory goes AFTER ../compat, so compat's own <string> etc. still win);
+          # if the SDK has none, fall back to an empty stub in compat.
+          GCCEH=$(find "$SYMBIAN_VOL/sdks" -path '*epoc32/include/gcce/gcce.h' -print -quit)
+          [ -n "$GCCEH" ] && { echo "--- $GCCEH (symcpp context)"; grep -n -B6 -A2 'symcpp' "$GCCEH" || true; }
+          SYMCPP=$(find "$SYMBIAN_VOL/sdks" "$SYMBIAN_VOL/toolchain" -name symcpp.h -print -quit 2>/dev/null || true)
+          CORE_MMP=symbian/group_core/cap32core.mmp
+          if [ -n "$SYMCPP" ]; then
+            SYMDIR=$(dirname "$SYMCPP")
+            case "$SYMDIR" in
+              */epoc32/*) SYMINC="/epoc32/${SYMDIR#*/epoc32/}" ;;
+              *)          SYMINC="$SYMDIR" ;;
+            esac
+            echo "symcpp.h found: $SYMCPP -> SYSTEMINCLUDE $SYMINC"
+            echo "SYSTEMINCLUDE   $SYMINC" >> "$CORE_MMP"
+          else
+            echo "symcpp.h not found anywhere in the SDK/toolchain; using an empty stub in compat"
+            printf '/* stub: gcce.h force-includes this; the core is freestanding */\n' > symbian/compat/symcpp.h
+          fi
           cd symbian/group_core
           bldmake bldfiles
           abld build -keepgoing gcce urel 2>&1 | tee "$GITHUB_WORKSPACE/core-build.log"
           LIB=$(find "$SYMBIAN_VOL/sdks" -name 'cap32core.lib' -print -quit)
-          test -n "$LIB" || { echo "cap32core.lib was not produced"; grep -n 'rror' "$GITHUB_WORKSPACE/core-build.log" | head -50; exit 1; }
+          test -n "$LIB" || { echo "cap32core.lib was not produced"; grep -n 'rror\|No rule' "$GITHUB_WORKSPACE/core-build.log" | head -50; exit 1; }
           ls -l "$LIB"
 
       - name: Build cap32.exe (C++98)
