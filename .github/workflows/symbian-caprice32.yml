@@ -3169,6 +3169,10 @@ jobs:
 
           USERINCLUDE     ../app/inc
           USERINCLUDE     ../inc
+          USERINCLUDE     ../sdl
+          // string.h: the SDK libc headers are not on the path. The functions it declares (strcpy, strlen, memcpy)
+          // are defined with C linkage in cap32core.lib, so a thin wrapper around compat/string.h is enough.
+          SYSTEMINCLUDE   ../appinc
           APP_LAYER_SYSTEMINCLUDE
 
           STATICLIBRARY   cap32core.lib
@@ -3902,6 +3906,8 @@ jobs:
           source toolchain/Scripts/env.sh
           /usr/bin/perl -pi -e 's/-std=gnu\+\+17/-std=gnu++98/' "$GCCEMK"
           grep -q 'gnu++98' "$GCCEMK" || { echo "could not restore gcce.mk"; exit 1; }
+          mkdir -p symbian/appinc
+          printf '#include "../compat/string.h"\n' > symbian/appinc/string.h
           cd symbian/group_app
           bldmake bldfiles
           abld build -keepgoing gcce urel 2>&1 | tee "$GITHUB_WORKSPACE/app-build.log"
