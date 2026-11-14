@@ -27,6 +27,9 @@ env:
   SYMBIAN_VOL: /Volumes/Symbian
   GNUPOC_COMMIT: d3ddaf58c734ad3ab34dc60a012f9d4768a9ed3e
   GCC4SYMBIAN_COMMIT: fe1b15a1c25716d5c515f12593080d58f14d4c3f
+  # OpenGL ES 2.0 presentation (EGL + GLES2 shader). Used only if the SDK ships EGL/GLES2 headers and
+  # import libs; the app falls back to the CWindowGc blit at runtime if EGL init fails. Set to 0 to disable.
+  CAP32_GLES2: '1'
 
 jobs:
   sources:
@@ -63,6 +66,10 @@ jobs:
           Config: `\caprice32\cap32.cfg`. Menu (top right): Resume / Reset (F5) / Speed (F9) / FPS (F8) / Joystick (F7) / Exit (F10).
           `KB` shows the on-screen CPC keyboard. Touch: left side D-pad, right side fire A/B (multitouch). Hardware keys: arrows,
           centre = fire, soft keys = menu/exit.
+
+          Video: if the SDK ships EGL + GLES2 the front end draws through an OpenGL ES 2.0 shader (GPU scaling, the pad /
+          keyboard overlay is rendered offscreen with the same Draw code and blended on top); if EGL init fails at runtime
+          it falls back to the CWindowGc blit. Disable at build time with `CAP32_GLES2: '0'` in the workflow env.
 
           Not supported: zip archives, IPF, PNG screenshots, network, the wGui menu.
           CAP32_EOF
@@ -172,6 +179,9 @@ jobs:
           // ---------------------------------------------------------------------------
           class CCapPump;
           class CCapIdle;
+          struct SCapGl;
+          class CFbsBitmapDevice;
+          class CFbsBitGc;
 
           class CCapContainer : public CCoeControl
               {
@@ -219,14 +229,28 @@ jobs:
               TInt KeyboardRowCount() const;
               TRect KeyRect(TInt aRow, TInt aStartUnits, TInt aWidthUnits, TInt aRowUnits) const;
               TBool MapSymbianKey(TInt aScanCode, TInt& aScan, TInt& aSym) const;
-              void DrawButton(CWindowGc& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const;
-              void DrawKeyboard(CWindowGc& aGc) const;
-              void DrawMenu(CWindowGc& aGc) const;
-              void DrawPad(CWindowGc& aGc) const;
+              void DrawButton(CGraphicsContext& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const;
+              void DrawKeyboard(CGraphicsContext& aGc) const;
+              void DrawMenu(CGraphicsContext& aGc) const;
+              void DrawPad(CGraphicsContext& aGc) const;
               TRect GameRect() const;
               void RedrawAll();
+              void DrawOverlay(CGraphicsContext& aGc) const;   // message, menu / keyboard / pad, buttons
+
+              // OpenGL ES 2.0 presentation (active only when built with CAP32_GLES2 and EGL init succeeded)
+              void GlInit();
+              void GlShutdown();
+              TBool GlPresent(const TUint32* aPix, TInt aW, TInt aH, TInt aPitch, const TRect& aSrc);
+              TBool GlDraw();
+              TBool GlUpdateOverlay();
+              void GlOverlayReset();
 
               CFbsBitmap* iBitmap;
+              SCapGl* iGl;                  // NULL = CPU path (CWindowGc::DrawBitmap)
+              CFbsBitmap* iOvlBmp;          // GL path: UI overlay rendered offscreen (EColor16MA)
+              CFbsBitmapDevice* iOvlDev;
+              CFbsBitGc* iOvlGc;
+              TBool iOvlDirty;
               TSize iBitmapSize;
               TRect iSrc;
               CAsyncCallBack* iStartCb;
@@ -538,6 +562,12 @@ jobs:
           #include "SDL_keycode.h"
           #include "lite_hooks.h"
           #include "cap32app.h"
+          #include <bitdev.h>
+          #include <bitstd.h>
+          #ifdef CAP32_GLES2
+          #include <EGL/egl.h>
+          #include <GLES2/gl2.h>
+          #endif
 
           #ifndef USE_MULTITOUCH
           #define USE_MULTITOUCH 1
@@ -654,6 +684,7 @@ jobs:
               delete iStartCb;
               delete iPumpTimer;
               delete iPumpIdle;
+              GlShutdown();
               delete iBitmap;
               }
 
@@ -676,6 +707,7 @@ jobs:
               iOneShotScan = -1;
               ComputeLayout();
               ActivateL();
+              GlInit();                 // no-op unless built with CAP32_GLES2
               iStartCb = new (ELeave) CAsyncCallBack(TCallBack(StartCb, this), CActive::EPriorityLow);
               iStartCb->CallBack();
               }
@@ -861,6 +893,7 @@ jobs:
           void CCapContainer::Present(const TUint32* aPix, TInt aW, TInt aH, TInt aPitch, const TRect& aSrc)
               {
               if (!iForeground) { return; }
+              if (iGl && GlPresent(aPix, aW, aH, aPitch, aSrc)) { return; }
               if (!iBitmap || iBitmapSize.iWidth != aW || iBitmapSize.iHeight != aH)
                   {
                   delete iBitmap; iBitmap = NULL;
@@ -890,7 +923,7 @@ jobs:
               return TRect(x, y, x + w, y + h);
               }
 
-          void CCapContainer::SizeChanged() { ComputeLayout(); }
+          void CCapContainer::SizeChanged() { ComputeLayout(); GlOverlayReset(); }
 
           void CCapContainer::ComputeLayout()
               {
@@ -921,7 +954,7 @@ jobs:
               }
 
           // ------------------------------------------------------------------ drawing
-          void CCapContainer::DrawButton(CWindowGc& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const
+          void CCapContainer::DrawButton(CGraphicsContext& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const
               {
               aGc.SetPenStyle(CGraphicsContext::ESolidPen);
               aGc.SetPenColor(KRgbWhite);
@@ -934,7 +967,7 @@ jobs:
               aGc.DiscardFont();
               }
 
-          void CCapContainer::DrawKeyboard(CWindowGc& aGc) const
+          void CCapContainer::DrawKeyboard(CGraphicsContext& aGc) const
               {
               for (TInt r = 0; r < 5; ++r)
                   {
@@ -951,7 +984,7 @@ jobs:
                   }
               }
 
-          void CCapContainer::DrawMenu(CWindowGc& aGc) const
+          void CCapContainer::DrawMenu(CGraphicsContext& aGc) const
               {
               for (TInt i = 0; i < 6; ++i)
                   {
@@ -962,7 +995,7 @@ jobs:
                   }
               }
 
-          void CCapContainer::DrawPad(CWindowGc& aGc) const
+          void CCapContainer::DrawPad(CGraphicsContext& aGc) const
               {
               aGc.SetPenStyle(CGraphicsContext::ESolidPen);
               aGc.SetPenColor(TRgb(0xC0, 0xC0, 0xC0));
@@ -994,6 +1027,14 @@ jobs:
 
           void CCapContainer::Draw(const TRect& aRect) const
               {
+              if (iGl)
+                  {
+                  // WSERV asked for a repaint: redo the overlay and redraw the last frame through GL.
+                  // If EGL is gone (e.g. after a background trip) GlDraw() shuts GL down and we fall through to the CPU path.
+                  CCapContainer* self = const_cast<CCapContainer*>(this);
+                  self->iOvlDirty = ETrue;
+                  if (self->GlDraw()) { return; }
+                  }
               CWindowGc& gc = SystemGc();
               TRect game = GameRect();
               if (aRect != game)
@@ -1009,6 +1050,11 @@ jobs:
                   if (src.Width() <= 0) { src = TRect(TPoint(0, 0), iBitmapSize); }
                   gc.DrawBitmap(game, iBitmap, src);
                   }
+              DrawOverlay(gc);
+              }
+
+          void CCapContainer::DrawOverlay(CGraphicsContext& gc) const
+              {
               if (iMessage.Length() > 0)
                   {
                   const CFont* f = CEikonEnv::Static()->NormalFont();
@@ -1028,6 +1074,272 @@ jobs:
               }
 
           void CCapContainer::RedrawAll() { iDirty = EFalse; DrawNow(); }
+
+          // ------------------------------------------------------------------ OpenGL ES 2.0 presentation
+          void CCapContainer::GlOverlayReset()
+              {
+              delete iOvlGc; iOvlGc = NULL;
+              delete iOvlDev; iOvlDev = NULL;
+              delete iOvlBmp; iOvlBmp = NULL;
+              iOvlDirty = ETrue;
+              if (iGl) { /* texture is re-specified on next upload */ }
+              }
+
+          #ifdef CAP32_GLES2
+          // The game frame (XRGB, bytes B,G,R,X) and the UI overlay (EColor16MA, bytes B,G,R,A) are uploaded as RGBA
+          // textures and swizzled in the fragment shader. The overlay reuses the exact same Draw* code as the CPU path.
+          struct SCapGl
+              {
+              EGLDisplay iDpy;
+              EGLSurface iSurf;
+              EGLContext iCtx;
+              GLuint iProg;
+              GLuint iTexGame;
+              GLuint iTexOvl;
+              GLint iLocTex;
+              GLint iLocOpaque;
+              TInt iGameW, iGameH;
+              TInt iOvlW, iOvlH;
+              };
+
+          static const char KCapVs[] =
+              "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv;"
+              "void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }";
+          static const char KCapFs[] =
+              "precision mediump float; varying vec2 v_uv; uniform sampler2D u_tex; uniform float u_opaque;"
+              "void main() { vec4 t = texture2D(u_tex, v_uv).bgra; gl_FragColor = vec4(t.rgb, u_opaque > 0.5 ? 1.0 : t.a); }";
+
+          static GLuint CapGlShader(GLenum aType, const char* aSrc)
+              {
+              GLuint sh = glCreateShader(aType);
+              if (!sh) { return 0; }
+              glShaderSource(sh, 1, &aSrc, NULL);
+              glCompileShader(sh);
+              GLint ok = 0;
+              glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+              if (!ok) { glDeleteShader(sh); return 0; }
+              return sh;
+              }
+
+          static void CapGlDestroy(SCapGl* g)
+              {
+              if (!g) { return; }
+              if (g->iDpy != EGL_NO_DISPLAY)
+                  {
+                  if (g->iCtx != EGL_NO_CONTEXT && g->iSurf != EGL_NO_SURFACE
+                      && eglMakeCurrent(g->iDpy, g->iSurf, g->iSurf, g->iCtx))
+                      {
+                      if (g->iProg) { glDeleteProgram(g->iProg); }
+                      if (g->iTexGame) { glDeleteTextures(1, &g->iTexGame); }
+                      if (g->iTexOvl) { glDeleteTextures(1, &g->iTexOvl); }
+                      }
+                  eglMakeCurrent(g->iDpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  if (g->iCtx != EGL_NO_CONTEXT) { eglDestroyContext(g->iDpy, g->iCtx); }
+                  if (g->iSurf != EGL_NO_SURFACE) { eglDestroySurface(g->iDpy, g->iSurf); }
+                  eglTerminate(g->iDpy);
+                  }
+              delete g;
+              }
+
+          static void CapGlSetupTexture(GLuint aTex, GLint aFilter)
+              {
+              glBindTexture(GL_TEXTURE_2D, aTex);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, aFilter);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, aFilter);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              }
+
+          // aDst in window pixels (origin top-left), u/v in texture space (v = 0 is the top row)
+          static void CapGlQuad(const TRect& aDst, const TSize& aScr, GLfloat aU0, GLfloat aV0, GLfloat aU1, GLfloat aV1)
+              {
+              GLfloat x0 = 2.0f * (GLfloat)aDst.iTl.iX / (GLfloat)aScr.iWidth - 1.0f;
+              GLfloat x1 = 2.0f * (GLfloat)aDst.iBr.iX / (GLfloat)aScr.iWidth - 1.0f;
+              GLfloat y0 = 1.0f - 2.0f * (GLfloat)aDst.iTl.iY / (GLfloat)aScr.iHeight;
+              GLfloat y1 = 1.0f - 2.0f * (GLfloat)aDst.iBr.iY / (GLfloat)aScr.iHeight;
+              const GLfloat v[16] = { x0, y1, aU0, aV1,   x1, y1, aU1, aV1,   x0, y0, aU0, aV0,   x1, y0, aU1, aV0 };
+              glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), v);
+              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), v + 2);
+              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              }
+
+          void CCapContainer::GlInit()
+              {
+              if (iGl) { return; }
+              SCapGl* g = new SCapGl;
+              if (!g) { return; }
+              g->iDpy = EGL_NO_DISPLAY; g->iSurf = EGL_NO_SURFACE; g->iCtx = EGL_NO_CONTEXT;
+              g->iProg = 0; g->iTexGame = 0; g->iTexOvl = 0; g->iLocTex = -1; g->iLocOpaque = -1;
+              g->iGameW = 0; g->iGameH = 0; g->iOvlW = 0; g->iOvlH = 0;
+              TBool ok = EFalse;
+              do
+                  {
+                  g->iDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+                  EGLint major = 0, minor = 0;
+                  if (g->iDpy == EGL_NO_DISPLAY) { break; }
+                  if (!eglInitialize(g->iDpy, &major, &minor)) { g->iDpy = EGL_NO_DISPLAY; break; }
+                  eglBindAPI(EGL_OPENGL_ES_API);
+                  const EGLint cfgAttr[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
+                  EGLConfig cfg = 0; EGLint n = 0;
+                  if (!eglChooseConfig(g->iDpy, cfgAttr, &cfg, 1, &n) || n < 1) { break; }
+                  g->iSurf = eglCreateWindowSurface(g->iDpy, cfg, (EGLNativeWindowType)&Window(), NULL);
+                  if (g->iSurf == EGL_NO_SURFACE) { break; }
+                  const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+                  g->iCtx = eglCreateContext(g->iDpy, cfg, EGL_NO_CONTEXT, ctxAttr);
+                  if (g->iCtx == EGL_NO_CONTEXT) { break; }
+                  if (!eglMakeCurrent(g->iDpy, g->iSurf, g->iSurf, g->iCtx)) { break; }
+                  eglSwapInterval(g->iDpy, 0);          // the core paces itself; don't block on vsync
+
+                  GLuint vs = CapGlShader(GL_VERTEX_SHADER, KCapVs);
+                  GLuint fs = vs ? CapGlShader(GL_FRAGMENT_SHADER, KCapFs) : 0;
+                  if (!vs || !fs) { if (vs) { glDeleteShader(vs); } break; }
+                  g->iProg = glCreateProgram();
+                  glAttachShader(g->iProg, vs);
+                  glAttachShader(g->iProg, fs);
+                  glBindAttribLocation(g->iProg, 0, "a_pos");
+                  glBindAttribLocation(g->iProg, 1, "a_uv");
+                  glLinkProgram(g->iProg);
+                  glDeleteShader(vs);
+                  glDeleteShader(fs);
+                  GLint linked = 0;
+                  glGetProgramiv(g->iProg, GL_LINK_STATUS, &linked);
+                  if (!linked) { break; }
+                  g->iLocTex = glGetUniformLocation(g->iProg, "u_tex");
+                  g->iLocOpaque = glGetUniformLocation(g->iProg, "u_opaque");
+
+                  glGenTextures(1, &g->iTexGame);
+                  CapGlSetupTexture(g->iTexGame, GL_LINEAR);
+                  glGenTextures(1, &g->iTexOvl);
+                  CapGlSetupTexture(g->iTexOvl, GL_NEAREST);
+                  ok = ETrue;
+                  }
+              while (0);
+              if (ok) { iGl = g; iOvlDirty = ETrue; }
+              else { CapGlDestroy(g); }
+              }
+
+          void CCapContainer::GlShutdown()
+              {
+              if (iGl) { CapGlDestroy(iGl); iGl = NULL; }
+              GlOverlayReset();
+              iDirty = ETrue;
+              }
+
+          TBool CCapContainer::GlPresent(const TUint32* aPix, TInt aW, TInt aH, TInt aPitch, const TRect& aSrc)
+              {
+              SCapGl* g = iGl;
+              if (!g || aPitch != aW * 4) { return EFalse; }
+              glBindTexture(GL_TEXTURE_2D, g->iTexGame);
+              if (g->iGameW != aW || g->iGameH != aH)
+                  {
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, aW, aH, 0, GL_RGBA, GL_UNSIGNED_BYTE, aPix);
+                  g->iGameW = aW; g->iGameH = aH;
+                  }
+              else
+                  {
+                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, aW, aH, GL_RGBA, GL_UNSIGNED_BYTE, aPix);
+                  }
+              iSrc = aSrc;
+              if (iDirty) { iDirty = EFalse; iOvlDirty = ETrue; }
+              return GlDraw();
+              }
+
+          // Renders the overlay with the regular Draw* helpers into an offscreen bitmap and uploads it.
+          TBool CCapContainer::GlUpdateOverlay()
+              {
+              SCapGl* g = iGl;
+              TSize s = Rect().Size();
+              if (!g || s.iWidth <= 0 || s.iHeight <= 0) { return EFalse; }
+              if (!iOvlBmp)
+                  {
+                  CFbsBitmap* b = new CFbsBitmap;
+                  if (!b) { return EFalse; }
+                  if (b->Create(s, EColor16MA) != KErrNone) { delete b; return EFalse; }
+                  CFbsBitmapDevice* d = NULL;
+                  TRAPD(e1, d = CFbsBitmapDevice::NewL(b));
+                  if (e1 != KErrNone || !d) { delete b; return EFalse; }
+                  CFbsBitGc* gc = NULL;
+                  if (d->CreateContext(gc) != KErrNone || !gc) { delete d; delete b; return EFalse; }
+                  iOvlBmp = b; iOvlDev = d; iOvlGc = gc;
+                  }
+              if (CFbsBitmap::ScanLineLength(s.iWidth, EColor16MA) != s.iWidth * 4) { return EFalse; }
+              iOvlGc->Reset();
+              iOvlGc->SetDrawMode(CGraphicsContext::EDrawModeWriteAlpha);
+              iOvlGc->SetBrushStyle(CGraphicsContext::ESolidBrush);
+              iOvlGc->SetBrushColor(TRgb::Color16MA(0));      // fully transparent
+              iOvlGc->SetPenStyle(CGraphicsContext::ENullPen);
+              iOvlGc->Clear();
+              iOvlGc->SetDrawMode(CGraphicsContext::EDrawModePEN);
+              DrawOverlay(*iOvlGc);
+              iOvlBmp->LockHeap();
+              glBindTexture(GL_TEXTURE_2D, g->iTexOvl);
+              if (g->iOvlW != s.iWidth || g->iOvlH != s.iHeight)
+                  {
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, s.iWidth, s.iHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, iOvlBmp->DataAddress());
+                  g->iOvlW = s.iWidth; g->iOvlH = s.iHeight;
+                  }
+              else
+                  {
+                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.iWidth, s.iHeight, GL_RGBA, GL_UNSIGNED_BYTE, iOvlBmp->DataAddress());
+                  }
+              iOvlBmp->UnlockHeap();
+              iOvlDirty = EFalse;
+              return ETrue;
+              }
+
+          TBool CCapContainer::GlDraw()
+              {
+              SCapGl* g = iGl;
+              if (!g) { return EFalse; }
+              TSize s = Rect().Size();
+              if (s.iWidth <= 0 || s.iHeight <= 0) { return ETrue; }
+              if (iOvlDirty) { GlUpdateOverlay(); }
+
+              glViewport(0, 0, s.iWidth, s.iHeight);
+              glDisable(GL_BLEND);
+              glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+              glClear(GL_COLOR_BUFFER_BIT);
+              glUseProgram(g->iProg);
+              glActiveTexture(GL_TEXTURE0);
+              glUniform1i(g->iLocTex, 0);
+              glEnableVertexAttribArray(0);
+              glEnableVertexAttribArray(1);
+
+              if (g->iGameW > 0)
+                  {
+                  TRect src = iSrc;
+                  if (src.Width() <= 0) { src = TRect(0, 0, g->iGameW, g->iGameH); }
+                  glBindTexture(GL_TEXTURE_2D, g->iTexGame);
+                  glUniform1f(g->iLocOpaque, 1.0f);
+                  CapGlQuad(GameRect(), s,
+                            (GLfloat)src.iTl.iX / (GLfloat)g->iGameW, (GLfloat)src.iTl.iY / (GLfloat)g->iGameH,
+                            (GLfloat)src.iBr.iX / (GLfloat)g->iGameW, (GLfloat)src.iBr.iY / (GLfloat)g->iGameH);
+                  }
+              if (g->iOvlW > 0)
+                  {
+                  glBindTexture(GL_TEXTURE_2D, g->iTexOvl);
+                  glUniform1f(g->iLocOpaque, 0.0f);
+                  glEnable(GL_BLEND);
+                  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                  CapGlQuad(TRect(0, 0, s.iWidth, s.iHeight), s, 0.0f, 0.0f, 1.0f, 1.0f);
+                  glDisable(GL_BLEND);
+                  }
+
+              if (!eglSwapBuffers(g->iDpy, g->iSurf))
+                  {
+                  GlShutdown();            // surface lost: continue with the CPU path
+                  return EFalse;
+                  }
+              return ETrue;
+              }
+          #else   // !CAP32_GLES2
+          void CCapContainer::GlInit() {}
+          void CCapContainer::GlShutdown() { GlOverlayReset(); }
+          TBool CCapContainer::GlPresent(const TUint32*, TInt, TInt, TInt, const TRect&) { return EFalse; }
+          TBool CCapContainer::GlDraw() { return EFalse; }
+          TBool CCapContainer::GlUpdateOverlay() { return EFalse; }
+          #endif  // CAP32_GLES2
 
           // ------------------------------------------------------------------ input: keys
           void CCapContainer::KeyPress(TInt aScan, TInt aSym, TInt aMod)
@@ -3942,6 +4254,19 @@ jobs:
           }
           #endif
           APPINC_EOF
+          # OpenGL ES 2.0 presentation: only when the SDK really ships EGL + GLES2 (headers and import libs).
+          # Otherwise the app is built with the plain CWindowGc blit, exactly as before.
+          GLH=$(find "$SYMBIAN_VOL/sdks" -path '*epoc32/include/GLES2/gl2.h' -print -quit)
+          EGH=$(find "$SYMBIAN_VOL/sdks" -path '*epoc32/include/EGL/egl.h' -print -quit)
+          EGLLIB=$(find "$SYMBIAN_VOL/sdks" -path '*release/armv5/lib/*' -iname 'libegl*' -print -quit)
+          GLLIB=$(find "$SYMBIAN_VOL/sdks" -path '*release/armv5/lib/*' -iname 'libglesv2*' -print -quit)
+          echo "GLES2 probe: gl2.h=[$GLH] egl.h=[$EGH] libEGL=[$EGLLIB] libGLESv2=[$GLLIB] CAP32_GLES2=$CAP32_GLES2"
+          if [ "$CAP32_GLES2" = "1" ] && [ -n "$GLH" ] && [ -n "$EGH" ] && [ -n "$EGLLIB" ] && [ -n "$GLLIB" ]; then
+            printf 'MACRO           CAP32_GLES2\nLIBRARY         libEGL.lib libGLESv2.lib\n' >> symbian/group_app/cap32.mmp
+            echo "OpenGL ES 2.0 presentation ENABLED"
+          else
+            echo "OpenGL ES 2.0 presentation disabled (not requested or SDK lacks EGL/GLES2): CPU blit path"
+          fi
           cd symbian/group_app
           bldmake bldfiles
           abld build -keepgoing gcce urel 2>&1 | tee "$GITHUB_WORKSPACE/app-build.log"
