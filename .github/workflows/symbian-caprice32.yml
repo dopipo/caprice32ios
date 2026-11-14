@@ -1934,6 +1934,14 @@ jobs:
           extern "C" {
           void __cxa_pure_virtual() { plat_exit(135); }
           }
+          #ifdef __SYMBIAN32__
+          /* The Symbian runtime has no __cxa_atexit/__dso_handle, but GCC registers global C++ destructors through
+             __aeabi_atexit -> __cxa_atexit.  Destructors of globals are simply never run (the process just exits). */
+          extern "C" {
+          void* __dso_handle = 0;
+          int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
+          }
+          #endif
 
           namespace std {
           static consolebuf g_cob(&cp_stdout), g_ceb(&cp_stderr);
