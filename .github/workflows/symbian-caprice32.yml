@@ -905,8 +905,7 @@ jobs:
               TUint t0 = plat_ticks();
               if (iGlState == 0) { TryInitGl(); }
               if (iGlState == 1) { PresentGl(aPix, aH, aPitch, aSrc); }
-              // profiling: Sync() waits until the window server has really finished drawing, so the time is honest
-              iCoeEnv->WsSession().Sync();
+              // profiling: D = upload + draw + swap of one frame
               TUint dt = plat_ticks() - t0;
               if (dt > 400) { dt = 400; }
               iDrawMs16 = iDrawMs16 ? (iDrawMs16 * 3 + dt * 16) / 4 : dt * 16;
