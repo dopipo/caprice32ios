@@ -27,9 +27,6 @@ env:
   SYMBIAN_VOL: /Volumes/Symbian
   GNUPOC_COMMIT: d3ddaf58c734ad3ab34dc60a012f9d4768a9ed3e
   GCC4SYMBIAN_COMMIT: fe1b15a1c25716d5c515f12593080d58f14d4c3f
-  # OpenGL ES 2.0 presentation (EGL + GLES2 shader). Used only if the SDK ships EGL/GLES2 headers and
-  # import libs; the app falls back to the CWindowGc blit at runtime if EGL init fails. Set to 0 to disable.
-  CAP32_GLES2: '1'
 
 jobs:
   sources:
@@ -66,10 +63,6 @@ jobs:
           Config: `\caprice32\cap32.cfg`. Menu (top right): Resume / Reset (F5) / Speed (F9) / FPS (F8) / Joystick (F7) / Exit (F10).
           `KB` shows the on-screen CPC keyboard. Touch: left side D-pad, right side fire A/B (multitouch). Hardware keys: arrows,
           centre = fire, soft keys = menu/exit.
-
-          Video: if the SDK ships EGL + GLES2 the front end draws through an OpenGL ES 2.0 shader (GPU scaling, the pad /
-          keyboard overlay is rendered offscreen with the same Draw code and blended on top); if EGL init fails at runtime
-          it falls back to the CWindowGc blit. Disable at build time with `CAP32_GLES2: '0'` in the workflow env.
 
           Not supported: zip archives, IPF, PNG screenshots, network, the wGui menu.
           CAP32_EOF
@@ -138,6 +131,9 @@ jobs:
 
           const TUid KUidCap32 = { (TInt32)0xE1A5C032 };
 
+          class CFbsBitmapDevice;
+          class CFbsBitGc;
+
           // ---------------------------------------------------------------------------
           // Audio: pull model driven by the core (lite_audio_*), pushes PCM16 to an MMF stream.
           // ---------------------------------------------------------------------------
@@ -179,9 +175,6 @@ jobs:
           // ---------------------------------------------------------------------------
           class CCapPump;
           class CCapIdle;
-          struct SCapGl;
-          class CFbsBitmapDevice;
-          class CFbsBitGc;
 
           class CCapContainer : public CCoeControl
               {
@@ -233,25 +226,16 @@ jobs:
               void DrawKeyboard(CGraphicsContext& aGc) const;
               void DrawMenu(CGraphicsContext& aGc) const;
               void DrawPad(CGraphicsContext& aGc) const;
+              void DrawOverlay(CGraphicsContext& aGc) const;   // buttons, menu, messages: window gc or the GL overlay bitmap
               TRect GameRect() const;
               void RedrawAll();
-              void DrawOverlay(CGraphicsContext& aGc) const;   // message, menu / keyboard / pad, buttons
+              void Refresh();                                  // redraw everything, through OpenGL ES 2 when it is active
+              TBool TryInitGl();
+              TBool PresentGl(const TUint32* aPix, TInt aH, TInt aPitch, const TRect& aSrc);
+              TBool RenderGl();
+              void UpdateOverlayTexture();
+              void ShutdownGl();
 
-              // OpenGL ES 2.0 presentation (active only when built with CAP32_GLES2 and EGL init succeeded)
-              void GlInit();
-              void GlShutdown();
-              TBool GlPresent(const TUint32* aPix, TInt aW, TInt aH, TInt aPitch, const TRect& aSrc);
-              TBool GlDraw();
-              TBool GlUpdateOverlay();
-              void GlOverlayReset();
-
-              CFbsBitmap* iBitmap;
-              SCapGl* iGl;                  // NULL = CPU path (CWindowGc::DrawBitmap)
-              CFbsBitmap* iOvlBmp;          // GL path: UI overlay rendered offscreen (EColor16MA)
-              CFbsBitmapDevice* iOvlDev;
-              CFbsBitGc* iOvlGc;
-              TBool iOvlDirty;
-              TSize iBitmapSize;
               TRect iSrc;
               CAsyncCallBack* iStartCb;
               CCapPump* iPumpTimer;
@@ -265,6 +249,19 @@ jobs:
               TBool iShiftLatch;
               TBool iCtrlLatch;
               TBool iDirty;
+              TUint iLastFrameTick;     // frame-skip state (zero-initialised: CBase)
+              TUint iFramePeriod16;     // smoothed time between emulated frames, ms * 16
+              TInt  iSkipRun;           // frames dropped in a row
+              TUint iDrawMs16;          // smoothed cost of showing one frame, ms * 16 (measured incl. window server)
+              TUint iWinTotal;          // profiling window: frames seen
+              TUint iWinShown;          // profiling window: frames actually shown
+              TBuf<40> iDbg;            // on-screen profiling text
+              TInt iGlState;            // 0 = not tried yet, 1 = OpenGL ES 2 active, 2 = off (unavailable, failed or disabled)
+              TBool iOverlayDirty;      // the buttons changed: re-render the overlay texture
+              CFbsBitmap* iOvlBmp;      // GL mode: the buttons are drawn once into this bitmap and shown as a texture
+              CFbsBitmapDevice* iOvlDev;
+              CFbsBitGc* iOvlGc;
+              TSize iOvlSize;
               TBool iQuit;
               TBuf<160> iMessage;
               TInt iOneShotScan;
@@ -562,12 +559,9 @@ jobs:
           #include "SDL_keycode.h"
           #include "lite_hooks.h"
           #include "cap32app.h"
+          #include "cap32_gl.h"
           #include <bitdev.h>
           #include <bitstd.h>
-          #ifdef CAP32_GLES2
-          #include <EGL/egl.h>
-          #include <GLES2/gl2.h>
-          #endif
 
           #ifndef USE_MULTITOUCH
           #define USE_MULTITOUCH 1
@@ -681,11 +675,10 @@ jobs:
           CCapContainer::~CCapContainer()
               {
               gCapContainer = NULL;
+              ShutdownGl();
               delete iStartCb;
               delete iPumpTimer;
               delete iPumpIdle;
-              GlShutdown();
-              delete iBitmap;
               }
 
           void CCapContainer::ConstructL(const TRect& /*aRect*/)
@@ -707,7 +700,6 @@ jobs:
               iOneShotScan = -1;
               ComputeLayout();
               ActivateL();
-              GlInit();                 // no-op unless built with CAP32_GLES2
               iStartCb = new (ELeave) CAsyncCallBack(TCallBack(StartCb, this), CActive::EPriorityLow);
               iStartCb->CallBack();
               }
@@ -796,7 +788,7 @@ jobs:
           void CCapContainer::ShowMessage(const TDesC& aMsg)
               {
               iMessage.Copy(aMsg.Left(iMessage.MaxLength()));
-              DrawNow();
+              Refresh();
               }
 
           void CCapContainer::RunEmulator()
@@ -856,7 +848,7 @@ jobs:
               {
               iForeground = aForeground;
               if (iStarted) { lite_post_window(aForeground ? 12 : 13); }
-              if (aForeground) { DrawNow(); }
+              if (aForeground) { Refresh(); }
               }
 
           // ------------------------------------------------------------------ nested scheduler pump
@@ -890,27 +882,41 @@ jobs:
               }
 
           // ------------------------------------------------------------------ frame presentation
+          extern "C" unsigned int plat_ticks(void);
+
           void CCapContainer::Present(const TUint32* aPix, TInt aW, TInt aH, TInt aPitch, const TRect& aSrc)
               {
               if (!iForeground) { return; }
-              if (iGl && GlPresent(aPix, aW, aH, aPitch, aSrc)) { return; }
-              if (!iBitmap || iBitmapSize.iWidth != aW || iBitmapSize.iHeight != aH)
+              // Adaptive frame skip. A CPC frame is 20 ms; when emulated frames arrive slower than that, the machine is
+              // running below real time, so drop the copy + stretch + overlay redraw of up to 2 frames in 3. That time goes
+              // back to the emulation; as soon as it keeps up again every frame is shown.
+              TUint now = plat_ticks();
+              ++iWinTotal;
+              if (iLastFrameTick)
                   {
-                  delete iBitmap; iBitmap = NULL;
-                  CFbsBitmap* b = new CFbsBitmap;
-                  if (!b) { return; }
-                  if (b->Create(TSize(aW, aH), EColor16MU) != KErrNone) { delete b; return; }
-                  iBitmap = b; iBitmapSize = TSize(aW, aH);
+                  TUint period = now - iLastFrameTick;
+                  if (period > 200) { period = 200; }
+                  iFramePeriod16 = iFramePeriod16 ? (iFramePeriod16 * 3 + period * 16) / 4 : period * 16;
                   }
-              iBitmap->LockHeap();
-              TUint8* dst = (TUint8*)iBitmap->DataAddress();
-              TInt dpitch = CFbsBitmap::ScanLineLength(aW, EColor16MU);
-              const TUint8* src = (const TUint8*)aPix;
-              for (TInt y = 0; y < aH; ++y) { Mem::Copy(dst + y * dpitch, src + y * aPitch, aW * 4); }
-              iBitmap->UnlockHeap();
-              iSrc = aSrc;
-              if (iDirty) { iDirty = EFalse; DrawNow(); }
-              else { DrawNow(GameRect()); }
+              iLastFrameTick = now;
+              if (!iDirty && iFramePeriod16 > 22 * 16 && iSkipRun < 2) { ++iSkipRun; return; }
+              iSkipRun = 0;
+              ++iWinShown;
+              TUint t0 = plat_ticks();
+              if (iGlState == 0) { TryInitGl(); }
+              if (iGlState == 1) { PresentGl(aPix, aH, aPitch, aSrc); }
+              // profiling: Sync() waits until the window server has really finished drawing, so the time is honest
+              iCoeEnv->WsSession().Sync();
+              TUint dt = plat_ticks() - t0;
+              if (dt > 400) { dt = 400; }
+              iDrawMs16 = iDrawMs16 ? (iDrawMs16 * 3 + dt * 16) / 4 : dt * 16;
+              if (iWinTotal >= 30)
+                  {
+                  // T = ms between emulated frames (20 = full speed), D = ms to show one frame, S = frames shown out of 30
+                  iDbg.Format(_L("T%u D%u S%u"), (iFramePeriod16 + 8) / 16, (iDrawMs16 + 8) / 16, iWinShown);
+                  iWinTotal = 0; iWinShown = 0;
+                  iOverlayDirty = ETrue;
+                  }
               }
 
           TRect CCapContainer::GameRect() const
@@ -923,7 +929,7 @@ jobs:
               return TRect(x, y, x + w, y + h);
               }
 
-          void CCapContainer::SizeChanged() { ComputeLayout(); GlOverlayReset(); }
+          void CCapContainer::SizeChanged() { ComputeLayout(); }
 
           void CCapContainer::ComputeLayout()
               {
@@ -1027,34 +1033,28 @@ jobs:
 
           void CCapContainer::Draw(const TRect& aRect) const
               {
-              if (iGl)
-                  {
-                  // WSERV asked for a repaint: redo the overlay and redraw the last frame through GL.
-                  // If EGL is gone (e.g. after a background trip) GlDraw() shuts GL down and we fall through to the CPU path.
-                  CCapContainer* self = const_cast<CCapContainer*>(this);
-                  self->iOvlDirty = ETrue;
-                  if (self->GlDraw()) { return; }
-                  }
+              if (iGlState == 1) { return; }   // OpenGL ES 2 owns the window and draws the picture and the buttons
+              // OpenGL ES 2 is not running: only the background, the buttons and the error message
               CWindowGc& gc = SystemGc();
-              TRect game = GameRect();
-              if (aRect != game)
-                  {
-                  gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
-                  gc.SetBrushColor(KRgbBlack);
-                  gc.SetPenStyle(CGraphicsContext::ENullPen);
-                  gc.Clear(aRect);
-                  }
-              if (iBitmap)
-                  {
-                  TRect src = iSrc;
-                  if (src.Width() <= 0) { src = TRect(TPoint(0, 0), iBitmapSize); }
-                  gc.DrawBitmap(game, iBitmap, src);
-                  }
+              gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              gc.SetBrushColor(KRgbBlack);
+              gc.SetPenStyle(CGraphicsContext::ENullPen);
+              gc.Clear(aRect);
               DrawOverlay(gc);
               }
 
           void CCapContainer::DrawOverlay(CGraphicsContext& gc) const
               {
+              TRect game = GameRect();
+              if (iDbg.Length() > 0)
+                  {
+                  const CFont* df = CEikonEnv::Static()->NormalFont();
+                  gc.UseFont(df);
+                  gc.SetPenStyle(CGraphicsContext::ESolidPen);
+                  gc.SetPenColor(KRgbYellow);
+                  gc.DrawText(iDbg, TRect(game.iTl.iX + 4, game.iBr.iY - 24, game.iBr.iX, game.iBr.iY), 18, CGraphicsContext::ELeft);
+                  gc.DiscardFont();
+                  }
               if (iMessage.Length() > 0)
                   {
                   const CFont* f = CEikonEnv::Static()->NormalFont();
@@ -1073,273 +1073,8 @@ jobs:
                   }
               }
 
-          void CCapContainer::RedrawAll() { iDirty = EFalse; DrawNow(); }
 
-          // ------------------------------------------------------------------ OpenGL ES 2.0 presentation
-          void CCapContainer::GlOverlayReset()
-              {
-              delete iOvlGc; iOvlGc = NULL;
-              delete iOvlDev; iOvlDev = NULL;
-              delete iOvlBmp; iOvlBmp = NULL;
-              iOvlDirty = ETrue;
-              if (iGl) { /* texture is re-specified on next upload */ }
-              }
-
-          #ifdef CAP32_GLES2
-          // The game frame (XRGB, bytes B,G,R,X) and the UI overlay (EColor16MA, bytes B,G,R,A) are uploaded as RGBA
-          // textures and swizzled in the fragment shader. The overlay reuses the exact same Draw* code as the CPU path.
-          struct SCapGl
-              {
-              EGLDisplay iDpy;
-              EGLSurface iSurf;
-              EGLContext iCtx;
-              GLuint iProg;
-              GLuint iTexGame;
-              GLuint iTexOvl;
-              GLint iLocTex;
-              GLint iLocOpaque;
-              TInt iGameW, iGameH;
-              TInt iOvlW, iOvlH;
-              };
-
-          static const char KCapVs[] =
-              "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv;"
-              "void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }";
-          static const char KCapFs[] =
-              "precision mediump float; varying vec2 v_uv; uniform sampler2D u_tex; uniform float u_opaque;"
-              "void main() { vec4 t = texture2D(u_tex, v_uv).bgra; gl_FragColor = vec4(t.rgb, u_opaque > 0.5 ? 1.0 : t.a); }";
-
-          static GLuint CapGlShader(GLenum aType, const char* aSrc)
-              {
-              GLuint sh = glCreateShader(aType);
-              if (!sh) { return 0; }
-              glShaderSource(sh, 1, &aSrc, NULL);
-              glCompileShader(sh);
-              GLint ok = 0;
-              glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-              if (!ok) { glDeleteShader(sh); return 0; }
-              return sh;
-              }
-
-          static void CapGlDestroy(SCapGl* g)
-              {
-              if (!g) { return; }
-              if (g->iDpy != EGL_NO_DISPLAY)
-                  {
-                  if (g->iCtx != EGL_NO_CONTEXT && g->iSurf != EGL_NO_SURFACE
-                      && eglMakeCurrent(g->iDpy, g->iSurf, g->iSurf, g->iCtx))
-                      {
-                      if (g->iProg) { glDeleteProgram(g->iProg); }
-                      if (g->iTexGame) { glDeleteTextures(1, &g->iTexGame); }
-                      if (g->iTexOvl) { glDeleteTextures(1, &g->iTexOvl); }
-                      }
-                  eglMakeCurrent(g->iDpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-                  if (g->iCtx != EGL_NO_CONTEXT) { eglDestroyContext(g->iDpy, g->iCtx); }
-                  if (g->iSurf != EGL_NO_SURFACE) { eglDestroySurface(g->iDpy, g->iSurf); }
-                  eglTerminate(g->iDpy);
-                  }
-              delete g;
-              }
-
-          static void CapGlSetupTexture(GLuint aTex, GLint aFilter)
-              {
-              glBindTexture(GL_TEXTURE_2D, aTex);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, aFilter);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, aFilter);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-              }
-
-          // aDst in window pixels (origin top-left), u/v in texture space (v = 0 is the top row)
-          static void CapGlQuad(const TRect& aDst, const TSize& aScr, GLfloat aU0, GLfloat aV0, GLfloat aU1, GLfloat aV1)
-              {
-              GLfloat x0 = 2.0f * (GLfloat)aDst.iTl.iX / (GLfloat)aScr.iWidth - 1.0f;
-              GLfloat x1 = 2.0f * (GLfloat)aDst.iBr.iX / (GLfloat)aScr.iWidth - 1.0f;
-              GLfloat y0 = 1.0f - 2.0f * (GLfloat)aDst.iTl.iY / (GLfloat)aScr.iHeight;
-              GLfloat y1 = 1.0f - 2.0f * (GLfloat)aDst.iBr.iY / (GLfloat)aScr.iHeight;
-              const GLfloat v[16] = { x0, y1, aU0, aV1,   x1, y1, aU1, aV1,   x0, y0, aU0, aV0,   x1, y0, aU1, aV0 };
-              glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), v);
-              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), v + 2);
-              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-              }
-
-          void CCapContainer::GlInit()
-              {
-              if (iGl) { return; }
-              SCapGl* g = new SCapGl;
-              if (!g) { return; }
-              g->iDpy = EGL_NO_DISPLAY; g->iSurf = EGL_NO_SURFACE; g->iCtx = EGL_NO_CONTEXT;
-              g->iProg = 0; g->iTexGame = 0; g->iTexOvl = 0; g->iLocTex = -1; g->iLocOpaque = -1;
-              g->iGameW = 0; g->iGameH = 0; g->iOvlW = 0; g->iOvlH = 0;
-              TBool ok = EFalse;
-              do
-                  {
-                  g->iDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-                  EGLint major = 0, minor = 0;
-                  if (g->iDpy == EGL_NO_DISPLAY) { break; }
-                  if (!eglInitialize(g->iDpy, &major, &minor)) { g->iDpy = EGL_NO_DISPLAY; break; }
-                  eglBindAPI(EGL_OPENGL_ES_API);
-                  const EGLint cfgAttr[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                                             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
-                  EGLConfig cfg = 0; EGLint n = 0;
-                  if (!eglChooseConfig(g->iDpy, cfgAttr, &cfg, 1, &n) || n < 1) { break; }
-                  g->iSurf = eglCreateWindowSurface(g->iDpy, cfg, (EGLNativeWindowType)&Window(), NULL);
-                  if (g->iSurf == EGL_NO_SURFACE) { break; }
-                  const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-                  g->iCtx = eglCreateContext(g->iDpy, cfg, EGL_NO_CONTEXT, ctxAttr);
-                  if (g->iCtx == EGL_NO_CONTEXT) { break; }
-                  if (!eglMakeCurrent(g->iDpy, g->iSurf, g->iSurf, g->iCtx)) { break; }
-                  eglSwapInterval(g->iDpy, 0);          // the core paces itself; don't block on vsync
-
-                  GLuint vs = CapGlShader(GL_VERTEX_SHADER, KCapVs);
-                  GLuint fs = vs ? CapGlShader(GL_FRAGMENT_SHADER, KCapFs) : 0;
-                  if (!vs || !fs) { if (vs) { glDeleteShader(vs); } break; }
-                  g->iProg = glCreateProgram();
-                  glAttachShader(g->iProg, vs);
-                  glAttachShader(g->iProg, fs);
-                  glBindAttribLocation(g->iProg, 0, "a_pos");
-                  glBindAttribLocation(g->iProg, 1, "a_uv");
-                  glLinkProgram(g->iProg);
-                  glDeleteShader(vs);
-                  glDeleteShader(fs);
-                  GLint linked = 0;
-                  glGetProgramiv(g->iProg, GL_LINK_STATUS, &linked);
-                  if (!linked) { break; }
-                  g->iLocTex = glGetUniformLocation(g->iProg, "u_tex");
-                  g->iLocOpaque = glGetUniformLocation(g->iProg, "u_opaque");
-
-                  glGenTextures(1, &g->iTexGame);
-                  CapGlSetupTexture(g->iTexGame, GL_LINEAR);
-                  glGenTextures(1, &g->iTexOvl);
-                  CapGlSetupTexture(g->iTexOvl, GL_NEAREST);
-                  ok = ETrue;
-                  }
-              while (0);
-              if (ok) { iGl = g; iOvlDirty = ETrue; }
-              else { CapGlDestroy(g); }
-              }
-
-          void CCapContainer::GlShutdown()
-              {
-              if (iGl) { CapGlDestroy(iGl); iGl = NULL; }
-              GlOverlayReset();
-              iDirty = ETrue;
-              }
-
-          TBool CCapContainer::GlPresent(const TUint32* aPix, TInt aW, TInt aH, TInt aPitch, const TRect& aSrc)
-              {
-              SCapGl* g = iGl;
-              if (!g || aPitch != aW * 4) { return EFalse; }
-              glBindTexture(GL_TEXTURE_2D, g->iTexGame);
-              if (g->iGameW != aW || g->iGameH != aH)
-                  {
-                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, aW, aH, 0, GL_RGBA, GL_UNSIGNED_BYTE, aPix);
-                  g->iGameW = aW; g->iGameH = aH;
-                  }
-              else
-                  {
-                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, aW, aH, GL_RGBA, GL_UNSIGNED_BYTE, aPix);
-                  }
-              iSrc = aSrc;
-              if (iDirty) { iDirty = EFalse; iOvlDirty = ETrue; }
-              return GlDraw();
-              }
-
-          // Renders the overlay with the regular Draw* helpers into an offscreen bitmap and uploads it.
-          TBool CCapContainer::GlUpdateOverlay()
-              {
-              SCapGl* g = iGl;
-              TSize s = Rect().Size();
-              if (!g || s.iWidth <= 0 || s.iHeight <= 0) { return EFalse; }
-              if (!iOvlBmp)
-                  {
-                  CFbsBitmap* b = new CFbsBitmap;
-                  if (!b) { return EFalse; }
-                  if (b->Create(s, EColor16MA) != KErrNone) { delete b; return EFalse; }
-                  CFbsBitmapDevice* d = NULL;
-                  TRAPD(e1, d = CFbsBitmapDevice::NewL(b));
-                  if (e1 != KErrNone || !d) { delete b; return EFalse; }
-                  CFbsBitGc* gc = NULL;
-                  if (d->CreateContext(gc) != KErrNone || !gc) { delete d; delete b; return EFalse; }
-                  iOvlBmp = b; iOvlDev = d; iOvlGc = gc;
-                  }
-              if (CFbsBitmap::ScanLineLength(s.iWidth, EColor16MA) != s.iWidth * 4) { return EFalse; }
-              iOvlGc->Reset();
-              iOvlGc->SetDrawMode(CGraphicsContext::EDrawModeWriteAlpha);
-              iOvlGc->SetBrushStyle(CGraphicsContext::ESolidBrush);
-              iOvlGc->SetBrushColor(TRgb::Color16MA(0));      // fully transparent
-              iOvlGc->SetPenStyle(CGraphicsContext::ENullPen);
-              iOvlGc->Clear();
-              iOvlGc->SetDrawMode(CGraphicsContext::EDrawModePEN);
-              DrawOverlay(*iOvlGc);
-              iOvlBmp->LockHeap();
-              glBindTexture(GL_TEXTURE_2D, g->iTexOvl);
-              if (g->iOvlW != s.iWidth || g->iOvlH != s.iHeight)
-                  {
-                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, s.iWidth, s.iHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, iOvlBmp->DataAddress());
-                  g->iOvlW = s.iWidth; g->iOvlH = s.iHeight;
-                  }
-              else
-                  {
-                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.iWidth, s.iHeight, GL_RGBA, GL_UNSIGNED_BYTE, iOvlBmp->DataAddress());
-                  }
-              iOvlBmp->UnlockHeap();
-              iOvlDirty = EFalse;
-              return ETrue;
-              }
-
-          TBool CCapContainer::GlDraw()
-              {
-              SCapGl* g = iGl;
-              if (!g) { return EFalse; }
-              TSize s = Rect().Size();
-              if (s.iWidth <= 0 || s.iHeight <= 0) { return ETrue; }
-              if (iOvlDirty) { GlUpdateOverlay(); }
-
-              glViewport(0, 0, s.iWidth, s.iHeight);
-              glDisable(GL_BLEND);
-              glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-              glClear(GL_COLOR_BUFFER_BIT);
-              glUseProgram(g->iProg);
-              glActiveTexture(GL_TEXTURE0);
-              glUniform1i(g->iLocTex, 0);
-              glEnableVertexAttribArray(0);
-              glEnableVertexAttribArray(1);
-
-              if (g->iGameW > 0)
-                  {
-                  TRect src = iSrc;
-                  if (src.Width() <= 0) { src = TRect(0, 0, g->iGameW, g->iGameH); }
-                  glBindTexture(GL_TEXTURE_2D, g->iTexGame);
-                  glUniform1f(g->iLocOpaque, 1.0f);
-                  CapGlQuad(GameRect(), s,
-                            (GLfloat)src.iTl.iX / (GLfloat)g->iGameW, (GLfloat)src.iTl.iY / (GLfloat)g->iGameH,
-                            (GLfloat)src.iBr.iX / (GLfloat)g->iGameW, (GLfloat)src.iBr.iY / (GLfloat)g->iGameH);
-                  }
-              if (g->iOvlW > 0)
-                  {
-                  glBindTexture(GL_TEXTURE_2D, g->iTexOvl);
-                  glUniform1f(g->iLocOpaque, 0.0f);
-                  glEnable(GL_BLEND);
-                  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                  CapGlQuad(TRect(0, 0, s.iWidth, s.iHeight), s, 0.0f, 0.0f, 1.0f, 1.0f);
-                  glDisable(GL_BLEND);
-                  }
-
-              if (!eglSwapBuffers(g->iDpy, g->iSurf))
-                  {
-                  GlShutdown();            // surface lost: continue with the CPU path
-                  return EFalse;
-                  }
-              return ETrue;
-              }
-          #else   // !CAP32_GLES2
-          void CCapContainer::GlInit() {}
-          void CCapContainer::GlShutdown() { GlOverlayReset(); }
-          TBool CCapContainer::GlPresent(const TUint32*, TInt, TInt, TInt, const TRect&) { return EFalse; }
-          TBool CCapContainer::GlDraw() { return EFalse; }
-          TBool CCapContainer::GlUpdateOverlay() { return EFalse; }
-          #endif  // CAP32_GLES2
+          void CCapContainer::RedrawAll() { iDirty = EFalse; Refresh(); }
 
           // ------------------------------------------------------------------ input: keys
           void CCapContainer::KeyPress(TInt aScan, TInt aSym, TInt aMod)
@@ -1564,7 +1299,7 @@ jobs:
                   }
               iPadMask = mask;
               if (mask != iLastPadMask) { iLastPadMask = mask; cap32_ios_set_pad(mask | iHwFire); iDirty = ETrue; }
-              if (iDirty && !iStarted) { iDirty = EFalse; DrawNow(); }
+              if (iDirty && !iStarted) { iDirty = EFalse; Refresh(); }
               }
 
           void CCapContainer::HandlePointerEventL(const TPointerEvent& aEvent)
@@ -1585,6 +1320,97 @@ jobs:
                       return;
                   }
               ApplyPointers();
+              }
+
+          // ------------------------------------------------------------------ OpenGL ES 2 renderer (the only renderer)
+          // The picture is a texture drawn by the GPU; the buttons are rendered once into a bitmap (magenta = transparent)
+          // and drawn on top as a second texture.  If OpenGL ES 2 cannot start, a message is shown instead of the picture.
+          void CCapContainer::Refresh()
+              {
+              if (iGlState == 1)
+                  {
+                  iOverlayDirty = ETrue;
+                  if (RenderGl()) { return; }
+                  }
+              DrawNow();
+              }
+
+          TBool CCapContainer::TryInitGl()
+              {
+              iGlState = 2;
+              TSize s = Size();
+              if (s.iWidth <= 0 || s.iHeight <= 0) { ShowMessage(_L("OpenGL ES 2: no window")); return EFalse; }
+              if (!cgl_init((void*)&Window(), s.iWidth, s.iHeight))
+                  {
+                  ShowMessage(_L("OpenGL ES 2 failed to start (EGL, GLES2 or shaders)"));
+                  return EFalse;
+                  }
+              CFbsBitmap* b = new CFbsBitmap;
+              CFbsBitmapDevice* dev = NULL;
+              CFbsBitGc* gc = NULL;
+              TInt err = b ? b->Create(s, EColor16MU) : KErrNoMemory;
+              if (err == KErrNone) { TRAP(err, dev = CFbsBitmapDevice::NewL(b)); }
+              if (err == KErrNone) { err = dev->CreateContext(gc); }
+              if (err != KErrNone)
+                  {
+                  delete gc; delete dev; delete b;
+                  cgl_shutdown();
+                  ShowMessage(_L("OpenGL ES 2: no memory for the button layer"));
+                  return EFalse;
+                  }
+              iOvlBmp = b; iOvlDev = dev; iOvlGc = gc; iOvlSize = s;
+              iOverlayDirty = ETrue;
+              iGlState = 1;
+              return ETrue;
+              }
+
+          void CCapContainer::ShutdownGl()
+              {
+              delete iOvlGc;  iOvlGc = NULL;
+              delete iOvlDev; iOvlDev = NULL;
+              delete iOvlBmp; iOvlBmp = NULL;
+              if (iGlState == 1) { cgl_shutdown(); }
+              iGlState = 2;
+              }
+
+          void CCapContainer::UpdateOverlayTexture()
+              {
+              if (!iOvlGc || !iOvlBmp) { return; }
+              iOvlGc->SetBrushStyle(CGraphicsContext::ESolidBrush);
+              iOvlGc->SetBrushColor(TRgb(255, 0, 255));           // key colour = transparent
+              iOvlGc->SetPenStyle(CGraphicsContext::ENullPen);
+              iOvlGc->Clear();
+              DrawOverlay(*iOvlGc);
+              iOvlBmp->LockHeap();
+              cgl_upload_overlay((const unsigned int*)iOvlBmp->DataAddress(), iOvlSize.iWidth, iOvlSize.iHeight);
+              iOvlBmp->UnlockHeap();
+              }
+
+          TBool CCapContainer::RenderGl()
+              {
+              TSize s = Size();
+              if (s != iOvlSize)
+                  {
+                  ShutdownGl();
+                  ShowMessage(_L("OpenGL ES 2: screen size changed, restart the app"));
+                  return EFalse;
+                  }
+              if (iOverlayDirty) { iOverlayDirty = EFalse; UpdateOverlayTexture(); }
+              TRect g = GameRect();
+              TInt sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
+              if (iSrc.Width() > 0 && iSrc.Height() > 0) { sx0 = iSrc.iTl.iX; sy0 = iSrc.iTl.iY; sx1 = iSrc.iBr.iX; sy1 = iSrc.iBr.iY; }
+              if (cgl_draw(g.iTl.iX, g.iTl.iY, g.iBr.iX, g.iBr.iY, sx0, sy0, sx1, sy1, s.iWidth, s.iHeight)) { return ETrue; }
+              ShutdownGl();
+              ShowMessage(_L("OpenGL ES 2: presenting failed"));
+              return EFalse;
+              }
+
+          TBool CCapContainer::PresentGl(const TUint32* aPix, TInt aH, TInt aPitch, const TRect& aSrc)
+              {
+              iSrc = aSrc;
+              if (iDirty) { iDirty = EFalse; iOverlayDirty = ETrue; }
+              cgl_upload_frame((const unsigned int*)aPix, aPitch / 4, aH);
+              return RenderGl();
               }
 
           // ------------------------------------------------------------------ hooks required by the core
@@ -1960,9 +1786,31 @@ jobs:
           // ---------------------------------------------------------------- memory
           #ifdef CP_DEFINE_MEM
           #define NOLOOP __attribute__((optimize("no-tree-loop-distribute-patterns")))
-          NOLOOP void* memcpy(void* d, const void* s, size_t n) { unsigned char* a = (unsigned char*)d; const unsigned char* b = (const unsigned char*)s; while (n--) *a++ = *b++; return d; }
+          typedef unsigned int __attribute__((may_alias)) cp_u32;
+          NOLOOP void* memcpy(void* d, const void* s, size_t n) {
+            unsigned char* a = (unsigned char*)d; const unsigned char* b = (const unsigned char*)s;
+            if (n >= 16 && ((((unsigned)(size_t)a) | ((unsigned)(size_t)b)) & 3) == 0) {
+              cp_u32* wa = (cp_u32*)a; const cp_u32* wb = (const cp_u32*)b;
+              while (n >= 16) { wa[0] = wb[0]; wa[1] = wb[1]; wa[2] = wb[2]; wa[3] = wb[3]; wa += 4; wb += 4; n -= 16; }
+              while (n >= 4) { *wa++ = *wb++; n -= 4; }
+              a = (unsigned char*)wa; b = (const unsigned char*)wb;
+            }
+            while (n--) *a++ = *b++;
+            return d;
+          }
           NOLOOP void* memmove(void* d, const void* s, size_t n) { unsigned char* a = (unsigned char*)d; const unsigned char* b = (const unsigned char*)s; if (a < b) { while (n--) *a++ = *b++; } else { a += n; b += n; while (n--) *--a = *--b; } return d; }
-          NOLOOP void* memset(void* d, int c, size_t n) { unsigned char* a = (unsigned char*)d; while (n--) *a++ = (unsigned char)c; return d; }
+          NOLOOP void* memset(void* d, int c, size_t n) {
+            unsigned char* a = (unsigned char*)d; unsigned char v = (unsigned char)c;
+            if (n >= 16) {
+              while (((unsigned)(size_t)a) & 3) { *a++ = v; --n; }
+              cp_u32 w = (cp_u32)v * 0x01010101u; cp_u32* wa = (cp_u32*)a;
+              while (n >= 16) { wa[0] = w; wa[1] = w; wa[2] = w; wa[3] = w; wa += 4; n -= 16; }
+              while (n >= 4) { *wa++ = w; n -= 4; }
+              a = (unsigned char*)wa;
+            }
+            while (n--) *a++ = v;
+            return d;
+          }
           NOLOOP int memcmp(const void* x, const void* y, size_t n) { const unsigned char* a = (const unsigned char*)x; const unsigned char* b = (const unsigned char*)y; for (; n; --n, ++a, ++b) if (*a != *b) return *a - *b; return 0; }
           NOLOOP void* memchr(const void* s, int c, size_t n) { const unsigned char* a = (const unsigned char*)s; for (; n; --n, ++a) if (*a == (unsigned char)c) return (void*)a; return 0; }
           NOLOOP size_t strlen(const char* s) { const char* p = s; while (*p) ++p; return (size_t)(p - s); }
@@ -3459,6 +3307,272 @@ jobs:
         run: |
           set -e
           mkdir -p symbian/group_app
+          cat > symbian/app/inc/cap32_gl.h <<'CAP32_EOF'
+          // cap32_gl.h - OpenGL ES 2 output for the Symbian^3 front end (the only renderer).
+          #ifndef CAP32_GL_H
+          #define CAP32_GL_H
+          int  cgl_init(void* aNativeWindow, int aW, int aH);                 // EGL window surface + GLES2 context + shaders
+          void cgl_shutdown(void);
+          void cgl_upload_frame(const unsigned int* aPx, int aTexW, int aH);  // XRGB8888, aTexW = pixels per row
+          void cgl_upload_overlay(const unsigned int* aPx, int aW, int aH);   // XRGB8888, magenta = transparent
+          int  cgl_draw(int gx0, int gy0, int gx1, int gy1,                   // game rectangle in window pixels
+                        int sx0, int sy0, int sx1, int sy1,                   // visible part of the frame (0 = whole frame)
+                        int winW, int winH);                                  // returns 0 when presenting failed
+          #endif
+          CAP32_EOF
+          cat > symbian/app/src/cap32_gl.cpp <<'CAP32_EOF'
+          // cap32_gl.cpp - OpenGL ES 2 output for the Symbian^3 front end.
+          #include "cap32_gl.h"
+
+          // Minimal EGL / OpenGL ES 2.0 declarations: the SDK headers are not on this build's include path.
+          extern "C" {
+          typedef int EGLint;
+          typedef unsigned int EGLBoolean;
+          typedef void* EGLDisplay;
+          typedef void* EGLConfig;
+          typedef void* EGLSurface;
+          typedef void* EGLContext;
+          EGLDisplay eglGetDisplay(void* aDisplayId);
+          EGLBoolean eglInitialize(EGLDisplay aDpy, EGLint* aMajor, EGLint* aMinor);
+          EGLBoolean eglTerminate(EGLDisplay aDpy);
+          EGLBoolean eglChooseConfig(EGLDisplay aDpy, const EGLint* aAttribs, EGLConfig* aConfigs, EGLint aSize, EGLint* aNum);
+          EGLSurface eglCreateWindowSurface(EGLDisplay aDpy, EGLConfig aCfg, void* aWin, const EGLint* aAttribs);
+          EGLContext eglCreateContext(EGLDisplay aDpy, EGLConfig aCfg, EGLContext aShare, const EGLint* aAttribs);
+          EGLBoolean eglMakeCurrent(EGLDisplay aDpy, EGLSurface aDraw, EGLSurface aRead, EGLContext aCtx);
+          EGLBoolean eglSwapBuffers(EGLDisplay aDpy, EGLSurface aSurf);
+          EGLBoolean eglDestroySurface(EGLDisplay aDpy, EGLSurface aSurf);
+          EGLBoolean eglDestroyContext(EGLDisplay aDpy, EGLContext aCtx);
+          }
+
+          typedef unsigned int GLenum;
+          typedef unsigned int GLbitfield;
+          typedef unsigned char GLboolean;
+          typedef int GLint;
+          typedef int GLsizei;
+          typedef unsigned int GLuint;
+          typedef float GLfloat;
+          typedef char GLchar;
+          typedef void GLvoid;
+          extern "C" {
+          void glActiveTexture(GLenum aTex);
+          void glAttachShader(GLuint aProg, GLuint aShader);
+          void glBindAttribLocation(GLuint aProg, GLuint aIndex, const GLchar* aName);
+          void glBindTexture(GLenum aTarget, GLuint aTex);
+          void glClear(GLbitfield aMask);
+          void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a);
+          void glCompileShader(GLuint aShader);
+          GLuint glCreateProgram(void);
+          GLuint glCreateShader(GLenum aType);
+          void glDeleteProgram(GLuint aProg);
+          void glDeleteShader(GLuint aShader);
+          void glDeleteTextures(GLsizei aN, const GLuint* aTex);
+          void glDrawArrays(GLenum aMode, GLint aFirst, GLsizei aCount);
+          void glEnableVertexAttribArray(GLuint aIndex);
+          void glGenTextures(GLsizei aN, GLuint* aTex);
+          void glGetProgramiv(GLuint aProg, GLenum aPname, GLint* aParams);
+          void glGetShaderiv(GLuint aShader, GLenum aPname, GLint* aParams);
+          GLint glGetUniformLocation(GLuint aProg, const GLchar* aName);
+          void glLinkProgram(GLuint aProg);
+          void glShaderSource(GLuint aShader, GLsizei aCount, const GLchar** aStrings, const GLint* aLengths);
+          void glTexImage2D(GLenum aTarget, GLint aLevel, GLint aInternal, GLsizei aW, GLsizei aH, GLint aBorder,
+                            GLenum aFormat, GLenum aType, const GLvoid* aPixels);
+          void glTexParameteri(GLenum aTarget, GLenum aPname, GLint aParam);
+          void glTexSubImage2D(GLenum aTarget, GLint aLevel, GLint aX, GLint aY, GLsizei aW, GLsizei aH,
+                               GLenum aFormat, GLenum aType, const GLvoid* aPixels);
+          void glUniform1f(GLint aLoc, GLfloat aV);
+          void glUniform1i(GLint aLoc, GLint aV);
+          void glUseProgram(GLuint aProg);
+          void glVertexAttribPointer(GLuint aIndex, GLint aSize, GLenum aType, GLboolean aNorm, GLsizei aStride, const GLvoid* aPtr);
+          void glViewport(GLint aX, GLint aY, GLsizei aW, GLsizei aH);
+          }
+
+          static const GLenum kTex2D = 0x0DE1, kMinF = 0x2801, kMagF = 0x2800, kWrapS = 0x2802, kWrapT = 0x2803;
+          static const GLint kNearest = 0x2600, kClamp = 0x812F;
+          static const GLenum kRGBA = 0x1908, kUByte = 0x1401, kFloat = 0x1406, kTriStrip = 5, kColorBit = 0x4000;
+          static const GLenum kVertexShader = 0x8B31, kFragmentShader = 0x8B30, kCompileStatus = 0x8B81, kLinkStatus = 0x8B82;
+          static const GLenum kTexture0 = 0x84C0;
+
+          static EGLDisplay gDpy = 0;
+          static EGLSurface gSurf = 0;
+          static EGLContext gCtx = 0;
+          static GLuint gProg = 0, gTexFrame = 0, gTexOvl = 0;
+          static GLint gLocTex = -1, gLocKey = -1;
+          static int gFrameW = 0, gFrameH = 0, gOvlW = 0, gOvlH = 0;
+
+          // The core and the overlay bitmap are XRGB8888 (bytes B,G,R,X in memory). Uploaded as RGBA the sampler sees
+          // (r=B, g=G, b=R), so .bgr restores the colour.  Magenta marks transparent overlay pixels; the test is tolerant
+          // because text edges blend with the key colour.
+          static const char kVS[] =
+              "attribute vec2 aPos;attribute vec2 aUV;varying vec2 vUV;"
+              "void main(){gl_Position=vec4(aPos,0.0,1.0);vUV=aUV;}";
+          static const char kFS[] =
+              "precision mediump float;varying vec2 vUV;uniform sampler2D uTex;uniform float uKey;"
+              "void main(){vec3 c=texture2D(uTex,vUV).bgr;"
+              "if(uKey>0.5&&c.r>0.8&&c.b>0.8&&c.g<0.5){discard;}"
+              "gl_FragColor=vec4(c,1.0);}";
+
+          static GLuint CompileShader(GLenum aType, const char* aSrc)
+              {
+              GLuint sh = glCreateShader(aType);
+              if (!sh) { return 0; }
+              glShaderSource(sh, 1, &aSrc, 0);
+              glCompileShader(sh);
+              GLint ok = 0;
+              glGetShaderiv(sh, kCompileStatus, &ok);
+              if (!ok) { glDeleteShader(sh); return 0; }
+              return sh;
+              }
+
+          static GLuint MakeTexture(GLint aFilter)
+              {
+              GLuint t = 0;
+              glGenTextures(1, &t);
+              glBindTexture(kTex2D, t);
+              glTexParameteri(kTex2D, kMinF, aFilter);
+              glTexParameteri(kTex2D, kMagF, aFilter);
+              glTexParameteri(kTex2D, kWrapS, kClamp);
+              glTexParameteri(kTex2D, kWrapT, kClamp);
+              return t;
+              }
+
+          static void DestroyEgl()
+              {
+              if (gDpy)
+                  {
+                  eglMakeCurrent(gDpy, 0, 0, 0);
+                  if (gSurf) { eglDestroySurface(gDpy, gSurf); }
+                  if (gCtx) { eglDestroyContext(gDpy, gCtx); }
+                  eglTerminate(gDpy);
+                  }
+              gDpy = 0; gSurf = 0; gCtx = 0;
+              }
+
+          int cgl_init(void* aNativeWindow, int aW, int aH)
+              {
+              gDpy = eglGetDisplay(0);
+              if (!gDpy) { return 0; }
+              EGLint maj = 0, min = 0;
+              if (!eglInitialize(gDpy, &maj, &min)) { gDpy = 0; return 0; }
+              const EGLint attr[] = { 0x3033 /*SURFACE_TYPE*/, 0x0004 /*WINDOW_BIT*/,
+                                      0x3040 /*RENDERABLE_TYPE*/, 0x0004 /*OPENGL_ES2_BIT*/, 0x3038 /*NONE*/ };
+              const EGLint ctxAttr[] = { 0x3098 /*CONTEXT_CLIENT_VERSION*/, 2, 0x3038 };
+              EGLConfig cfg[24];
+              EGLint n = 0;
+              if (!eglChooseConfig(gDpy, attr, cfg, 24, &n) || n < 1) { DestroyEgl(); return 0; }
+              // the first configs may not match the window's pixel format: try them until one gives a surface + context
+              for (EGLint i = 0; i < n && !gCtx; ++i)
+                  {
+                  EGLSurface sf = eglCreateWindowSurface(gDpy, cfg[i], aNativeWindow, 0);
+                  if (!sf) { continue; }
+                  EGLContext cx = eglCreateContext(gDpy, cfg[i], 0, ctxAttr);
+                  if (!cx) { eglDestroySurface(gDpy, sf); continue; }
+                  if (!eglMakeCurrent(gDpy, sf, sf, cx)) { eglDestroyContext(gDpy, cx); eglDestroySurface(gDpy, sf); continue; }
+                  gSurf = sf; gCtx = cx;
+                  }
+              if (!gCtx) { DestroyEgl(); return 0; }
+
+              GLuint vs = CompileShader(kVertexShader, kVS), fs = CompileShader(kFragmentShader, kFS);
+              if (!vs || !fs) { DestroyEgl(); return 0; }
+              gProg = glCreateProgram();
+              glAttachShader(gProg, vs);
+              glAttachShader(gProg, fs);
+              glBindAttribLocation(gProg, 0, "aPos");
+              glBindAttribLocation(gProg, 1, "aUV");
+              glLinkProgram(gProg);
+              GLint ok = 0;
+              glGetProgramiv(gProg, kLinkStatus, &ok);
+              glDeleteShader(vs);
+              glDeleteShader(fs);
+              if (!ok) { glDeleteProgram(gProg); gProg = 0; DestroyEgl(); return 0; }
+              gLocTex = glGetUniformLocation(gProg, "uTex");
+              gLocKey = glGetUniformLocation(gProg, "uKey");
+              gTexFrame = MakeTexture(0x2601 /*LINEAR*/);
+              gTexOvl = MakeTexture(kNearest);
+              glEnableVertexAttribArray(0);
+              glEnableVertexAttribArray(1);
+              glViewport(0, 0, aW, aH);
+              gFrameW = gFrameH = gOvlW = gOvlH = 0;
+              return 1;
+              }
+
+          void cgl_shutdown(void)
+              {
+              if (gCtx)
+                  {
+                  if (gTexFrame) { glDeleteTextures(1, &gTexFrame); }
+                  if (gTexOvl) { glDeleteTextures(1, &gTexOvl); }
+                  if (gProg) { glDeleteProgram(gProg); }
+                  }
+              gTexFrame = gTexOvl = gProg = 0;
+              DestroyEgl();
+              }
+
+          void cgl_upload_frame(const unsigned int* aPx, int aTexW, int aH)
+              {
+              if (!gCtx || aTexW <= 0 || aH <= 0) { return; }
+              glBindTexture(kTex2D, gTexFrame);
+              if (aTexW != gFrameW || aH != gFrameH)
+                  {
+                  glTexImage2D(kTex2D, 0, (GLint)kRGBA, aTexW, aH, 0, kRGBA, kUByte, aPx);
+                  gFrameW = aTexW; gFrameH = aH;
+                  }
+              else
+                  {
+                  glTexSubImage2D(kTex2D, 0, 0, 0, aTexW, aH, kRGBA, kUByte, aPx);
+                  }
+              }
+
+          void cgl_upload_overlay(const unsigned int* aPx, int aW, int aH)
+              {
+              if (!gCtx || aW <= 0 || aH <= 0) { return; }
+              glBindTexture(kTex2D, gTexOvl);
+              if (aW != gOvlW || aH != gOvlH)
+                  {
+                  glTexImage2D(kTex2D, 0, (GLint)kRGBA, aW, aH, 0, kRGBA, kUByte, aPx);
+                  gOvlW = aW; gOvlH = aH;
+                  }
+              else
+                  {
+                  glTexSubImage2D(kTex2D, 0, 0, 0, aW, aH, kRGBA, kUByte, aPx);
+                  }
+              }
+
+          static void Quad(float aX0, float aY0, float aX1, float aY1, float aU0, float aV0, float aU1, float aV1)
+              {
+              const float v[16] = { aX0, aY0, aU0, aV0,   aX1, aY0, aU1, aV0,   aX0, aY1, aU0, aV1,   aX1, aY1, aU1, aV1 };
+              glVertexAttribPointer(0, 2, kFloat, 0, 16, v);
+              glVertexAttribPointer(1, 2, kFloat, 0, 16, v + 2);
+              glDrawArrays(kTriStrip, 0, 4);
+              }
+
+          int cgl_draw(int gx0, int gy0, int gx1, int gy1, int sx0, int sy0, int sx1, int sy1, int winW, int winH)
+              {
+              if (!gCtx || winW <= 0 || winH <= 0) { return 0; }
+              glViewport(0, 0, winW, winH);
+              glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+              glClear(kColorBit);
+              glUseProgram(gProg);
+              glActiveTexture(kTexture0);
+              glUniform1i(gLocTex, 0);
+              if (gFrameW > 0 && gFrameH > 0)
+                  {
+                  if (sx1 <= sx0 || sy1 <= sy0) { sx0 = 0; sy0 = 0; sx1 = gFrameW; sy1 = gFrameH; }
+                  const float W = (float)winW, H = (float)winH;
+                  glBindTexture(kTex2D, gTexFrame);
+                  glUniform1f(gLocKey, 0.0f);
+                  Quad(gx0 / W * 2.0f - 1.0f, 1.0f - gy0 / H * 2.0f, gx1 / W * 2.0f - 1.0f, 1.0f - gy1 / H * 2.0f,
+                       (float)sx0 / gFrameW, (float)sy0 / gFrameH, (float)sx1 / gFrameW, (float)sy1 / gFrameH);
+                  }
+              if (gOvlW > 0 && gOvlH > 0)
+                  {
+                  glBindTexture(kTex2D, gTexOvl);
+                  glUniform1f(gLocKey, 1.0f);
+                  Quad(-1.0f, 1.0f, 1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f);
+                  }
+              return eglSwapBuffers(gDpy, gSurf) ? 1 : 0;
+              }
+
+          CAP32_EOF
           cat > symbian/group_app/bld.inf <<'CAP32_EOF'
           PRJ_PLATFORMS
           DEFAULT
@@ -3485,6 +3599,7 @@ jobs:
           SOURCE          cap32_app.cpp
           SOURCE          cap32_audio.cpp
           SOURCE          cap32_container.cpp
+          SOURCE          cap32_gl.cpp
           SOURCE          plat_symbian.cpp
 
           USERINCLUDE     ../app/inc
@@ -4254,19 +4369,18 @@ jobs:
           }
           #endif
           APPINC_EOF
-          # OpenGL ES 2.0 presentation: only when the SDK really ships EGL + GLES2 (headers and import libs).
-          # Otherwise the app is built with the plain CWindowGc blit, exactly as before.
-          GLH=$(find "$SYMBIAN_VOL/sdks" -path '*epoc32/include/GLES2/gl2.h' -print -quit)
-          EGH=$(find "$SYMBIAN_VOL/sdks" -path '*epoc32/include/EGL/egl.h' -print -quit)
-          EGLLIB=$(find "$SYMBIAN_VOL/sdks" -path '*release/armv5/lib/*' -iname 'libegl*' -print -quit)
-          GLLIB=$(find "$SYMBIAN_VOL/sdks" -path '*release/armv5/lib/*' -iname 'libglesv2*' -print -quit)
-          echo "GLES2 probe: gl2.h=[$GLH] egl.h=[$EGH] libEGL=[$EGLLIB] libGLESv2=[$GLLIB] CAP32_GLES2=$CAP32_GLES2"
-          if [ "$CAP32_GLES2" = "1" ] && [ -n "$GLH" ] && [ -n "$EGH" ] && [ -n "$EGLLIB" ] && [ -n "$GLLIB" ]; then
-            printf 'MACRO           CAP32_GLES2\nLIBRARY         libEGL.lib libGLESv2.lib\n' >> symbian/group_app/cap32.mmp
-            echo "OpenGL ES 2.0 presentation ENABLED"
-          else
-            echo "OpenGL ES 2.0 presentation disabled (not requested or SDK lacks EGL/GLES2): CPU blit path"
+          # OpenGL ES 2 is the only renderer: the SDK must ship the EGL and GLES2 import libraries (.dso for GCCE)
+          GLDIR=$(find "$SYMBIAN_VOL/sdks" -type d -ipath '*epoc32/release/armv5/lib' -print -quit 2>/dev/null || true)
+          echo "--- EGL/GLES libraries in ${GLDIR:-<no lib dir>}:"
+          ls "$GLDIR" 2>/dev/null | grep -i 'egl\|gles' || true
+          EGLB=$(ls "$GLDIR" 2>/dev/null | grep -i '^libegl\.dso$' | head -1 | sed 's/\.[^.]*$//' || true)
+          GLESB=$(ls "$GLDIR" 2>/dev/null | grep -i '^libglesv2\.dso$' | head -1 | sed 's/\.[^.]*$//' || true)
+          if [ -z "$EGLB" ] || [ -z "$GLESB" ]; then
+            echo "::error::EGL/GLES2 import libraries (libegl.dso, libglesv2.dso) not found in the SDK: cannot build the OpenGL ES 2 renderer"
+            exit 1
           fi
+          echo "OpenGL ES 2 libraries: $EGLB $GLESB"
+          echo "LIBRARY         $EGLB.lib $GLESB.lib bitgdi.lib" >> symbian/group_app/cap32.mmp
           cd symbian/group_app
           bldmake bldfiles
           abld build -keepgoing gcce urel 2>&1 | tee "$GITHUB_WORKSPACE/app-build.log"
