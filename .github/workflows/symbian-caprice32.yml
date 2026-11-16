@@ -164,6 +164,7 @@ jobs:
               TInt iSlotBytes;
               TUint iOpenTick;
               TUint iNextFake;
+              TUint iLastAct;           // last time a buffer was queued or returned by the stream (stall detector)
               HBufC8* iBuf[KSlots];
               TBool iBusy[KSlots];
               };
@@ -474,6 +475,7 @@ jobs:
               {
               iRate = aRate; iChannels = aChannels; iSlotBytes = aSlotBytes;
               iOpenTick = lite_ticks();
+              iLastAct = iOpenTick;
               for (TInt i = 0; i < KSlots; ++i)
                   {
                   iBuf[i] = HBufC8::NewL(aSlotBytes);
@@ -497,6 +499,7 @@ jobs:
           void CCapAudio::MaoscBufferCopied(TInt aError, const TDesC8& aBuffer)
               {
               if (aError != KErrNone && aError != KErrCancel) { caplog_i("Audio: buffer error", aError); iFailed = ETrue; }
+              iLastAct = lite_ticks();
               for (TInt i = 0; i < KSlots; ++i)
                   {
                   if (iBuf[i]->Ptr() == aBuffer.Ptr()) { iBusy[i] = EFalse; }
@@ -524,6 +527,18 @@ jobs:
                   return EFalse;
                   }
               for (TInt i = 0; i < KSlots; ++i) { if (!iBusy[i]) { return ETrue; } }
+              // Every slot is queued and the stream has returned none for a long time (the device took the audio
+              // resource, the stream stalled, an underflow without a callback): the core waits for a played buffer
+              // forever and the emulator looks frozen.  Give the stream up and fall back to silent pacing.
+              if (now - iLastAct > 700)
+                  {
+                  caplog_i("Audio: stream stalled, falling back to silent pacing, ms", (int)(now - iLastAct));
+                  iStream->Stop();
+                  for (TInt i = 0; i < KSlots; ++i) { iBusy[i] = EFalse; }
+                  iReady = EFalse;
+                  iFailed = ETrue;
+                  iNextFake = 0;
+                  }
               return EFalse;
               }
 
@@ -544,6 +559,8 @@ jobs:
                       TPtr8 p = iBuf[i]->Des();
                       p.Copy(aData, aLen);
                       iBusy[i] = ETrue;
+                      { TBool any = EFalse; for (TInt k = 0; k < KSlots; ++k) { if (iBusy[k] && k != i) { any = ETrue; } }
+                        if (!any) { iLastAct = lite_ticks(); } }   // the stream was idle: the stall timer starts now
                       TRAPD(err, iStream->WriteL(*iBuf[i]));
                       if (err != KErrNone) { iBusy[i] = EFalse; return EFalse; }
                       return ETrue;
@@ -896,11 +913,26 @@ jobs:
 
           extern "C" unsigned int plat_ticks(void);
 
+          static TUint gPresents = 0;
+          static TUint gPumps = 0;
+          static TUint gHbTick = 0;
+
           void CCapContainer::Pump(TInt aMs)
               {
               FlushPending();
               if (iPumping) { return; }
               caplog_progress();
+              ++gPumps;
+              {
+                  TUint t = plat_ticks();
+                  if (gHbTick == 0) { gHbTick = t; }
+                  if (t - gHbTick >= 5000)                // time based: the frame based heartbeat never fired on a slow run
+                      {
+                      gHbTick = t;
+                      caplog_i("alive: presented frames", (int)gPresents);
+                      caplog_i("alive: pumps", (int)gPumps);
+                      }
+              }
               TUint pumpStart = plat_ticks();
               for (;;)
                   {
@@ -949,7 +981,7 @@ jobs:
               iPumpAcc = 0;
               caplog_progress();
               caplog_fast("Present: begin");
-              { static TUint hb = 0; if ((++hb % 250) == 0) { caplog_heartbeat(hb); } }
+              ++gPresents;
               ++iWinShown;
               TUint t0 = plat_ticks();
               if (iGlState == 0) { TryInitGl(); }
@@ -4449,7 +4481,10 @@ jobs:
             if (g_qh == g_qt) return 0;
             if (e) *e = g_q[g_qh]; g_qh = (g_qh + 1) % QN; return 1;
           }
-          extern "C" void SDL_Delay(Uint32 ms) { lite_pump((int)ms); service_audio(); }
+          // The core waits for the audio callback with SDL_Delay(1).  A timed 1 ms pump on Symbian really sleeps one
+          // 64 Hz timer tick (~15.6 ms), so every sound buffer cost at least that and the emulator ran far below real
+          // time (the watchdog showed ~140 progress ticks/s = 2 per Pump).  Short delays only yield to the scheduler.
+          extern "C" void SDL_Delay(Uint32 ms) { service_audio(); lite_pump(ms <= 2 ? 0 : (int)ms); service_audio(); }
 
           // ---------------------------------------------------------------- joystick (none)
           extern "C" int SDL_NumJoysticks(void) { return 0; }
