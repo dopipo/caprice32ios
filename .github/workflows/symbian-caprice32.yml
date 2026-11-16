@@ -251,7 +251,9 @@ jobs:
               TBool iDirty;
               TUint iLastFrameTick;     // frame-skip state (zero-initialised: CBase)
               TUint iFramePeriod16;     // smoothed time between emulated frames, ms * 16
-              TInt  iSkipRun;           // frames dropped in a row
+              TInt  iSkipRun;           // (unused)
+              TUint iPumpAcc;           // ms spent inside Pump() since the last shown frame
+              TUint iPumpMs16;          // smoothed Pump() time per shown frame, ms * 16
               TUint iDrawMs16;          // smoothed cost of showing one frame, ms * 16 (measured incl. window server)
               TUint iWinTotal;          // profiling window: frames seen
               TUint iWinShown;          // profiling window: frames actually shown
@@ -345,6 +347,7 @@ jobs:
           #include <eikspane.h>
           #include <eikbtgpc.h>
           #include "cap32app.h"
+          #include "cap32_log.h"
 
           CApaDocument* CCapApplication::CreateDocumentL() { return new (ELeave) CCapDocument(*this); }
           TUid CCapApplication::AppDllUid() const { return KUidCap32; }
@@ -352,14 +355,20 @@ jobs:
 
           void CCapAppUi::ConstructL()
               {
+              caplog("AppUi: BaseConstructL");
               BaseConstructL(CAknAppUi::EAknEnableSkin);
+              caplog("AppUi: SetOrientationL");
               SetOrientationL(CAknAppUiBase::EAppUiOrientationLandscape);
               CEikStatusPane* sp = StatusPane();
               if (sp) { sp->MakeVisible(EFalse); }
               CEikButtonGroupContainer* cba = Cba();
               if (cba) { cba->MakeVisible(EFalse); }
-              iContainer = CCapContainer::NewL(ApplicationRect());
+              caplog("AppUi: creating the container");
+              TRAPD(err, iContainer = CCapContainer::NewL(ApplicationRect()));
+              if (err != KErrNone) { caplog_i("AppUi: container NewL LEFT with", err); User::Leave(err); }
+              caplog("AppUi: AddToStackL");
               AddToStackL(iContainer);
+              caplog("AppUi: ready");
               }
 
           CCapAppUi::~CCapAppUi()
@@ -390,6 +399,7 @@ jobs:
 
           void CCapAppUi::HandleForegroundEventL(TBool aForeground)
               {
+              caplog_i("AppUi: foreground", (int)aForeground);
               CAknAppUi::HandleForegroundEventL(aForeground);
               if (iContainer) { iContainer->SetForeground(aForeground); }
               }
@@ -405,7 +415,14 @@ jobs:
 
           LOCAL_C CApaApplication* NewApplication() { return new CCapApplication; }
 
-          GLDEF_C TInt E32Main() { return EikStart::RunApplication(NewApplication); }
+          GLDEF_C TInt E32Main()
+              {
+              caplog_start();
+              caplog("E32Main: RunApplication");
+              TInt r = EikStart::RunApplication(NewApplication);
+              caplog_i("E32Main: RunApplication returned", r);
+              return r;
+              }
           CAP32_EOF
           mkdir -p symbian/app/src
           cat > symbian/app/src/cap32_audio.cpp <<'CAP32_EOF'
@@ -413,6 +430,7 @@ jobs:
           #include <hal.h>
           #include "cap32app.h"
           #include "lite_hooks.h"
+          #include "cap32_log.h"
 
           CCapAudio* gCapAudio = NULL;
 
@@ -464,9 +482,10 @@ jobs:
 
           void CCapAudio::MaoscOpenComplete(TInt aError)
               {
-              if (aError != KErrNone) { iFailed = ETrue; return; }
+              if (aError != KErrNone) { caplog_i("Audio: open failed", aError); iFailed = ETrue; return; }
+              caplog("Audio: stream opened");
               TRAPD(err, iStream->SetAudioPropertiesL(RateConst(iRate), iChannels == 2 ? 2 : 1));
-              if (err != KErrNone) { iFailed = ETrue; return; }
+              if (err != KErrNone) { caplog_i("Audio: SetAudioPropertiesL failed", err); iFailed = ETrue; return; }
               iStream->SetVolume(iStream->MaxVolume() / 2);
               iStream->SetPriority(EPriorityNormal, EMdaPriorityPreferenceTime);
               iReady = ETrue;
@@ -474,7 +493,7 @@ jobs:
 
           void CCapAudio::MaoscBufferCopied(TInt aError, const TDesC8& aBuffer)
               {
-              if (aError != KErrNone && aError != KErrCancel) { iFailed = ETrue; }
+              if (aError != KErrNone && aError != KErrCancel) { caplog_i("Audio: buffer error", aError); iFailed = ETrue; }
               for (TInt i = 0; i < KSlots; ++i)
                   {
                   if (iBuf[i]->Ptr() == aBuffer.Ptr()) { iBusy[i] = EFalse; }
@@ -483,7 +502,7 @@ jobs:
 
           void CCapAudio::MaoscPlayComplete(TInt aError)
               {
-              if (aError != KErrNone && aError != KErrCancel) { iFailed = ETrue; }
+              if (aError != KErrNone && aError != KErrCancel) { caplog_i("Audio: play complete error", aError); iFailed = ETrue; }
               for (TInt i = 0; i < KSlots; ++i) { iBusy[i] = EFalse; }
               }
 
@@ -536,8 +555,9 @@ jobs:
           extern "C" int lite_audio_open(int freq, int channels, int bits, int samples)
               {
               if (gCapAudio) { return 1; }
+              caplog_i("Audio: lite_audio_open, rate", freq);
               TRAPD(err, gCapAudio = CCapAudio::NewL(freq, channels, samples * channels * (bits / 8)));
-              if (err != KErrNone) { gCapAudio = NULL; return 0; }
+              if (err != KErrNone) { caplog_i("Audio: NewL LEFT with", err); gCapAudio = NULL; return 0; }
               return 1;
               }
           extern "C" int lite_audio_can_write(void) { return gCapAudio ? gCapAudio->CanWrite() : 0; }
@@ -560,6 +580,7 @@ jobs:
           #include "lite_hooks.h"
           #include "cap32app.h"
           #include "cap32_gl.h"
+          #include "cap32_log.h"
           #include <bitdev.h>
           #include <bitstd.h>
 
@@ -684,6 +705,7 @@ jobs:
           void CCapContainer::ConstructL(const TRect& /*aRect*/)
               {
               gCapContainer = this;
+              caplog("Container: CreateWindowL");
               CreateWindowL();
               SetExtentToWholeScreen();
           #if USE_MULTITOUCH
@@ -693,13 +715,17 @@ jobs:
               EnableDragEvents();
               SetFocusing(ETrue);
               iForeground = ETrue;
+              caplog("Container: pump objects");
               iPumpTimer = CCapPump::NewL(this);
               iPumpIdle = CCapIdle::NewL(this);
               for (TInt i = 0; i < KMaxPtr; ++i) { iPtr[i].iDown = EFalse; iPtr[i].iHit = KHitNone; iPtr[i].iMod = 0; }
               for (TInt i = 0; i < KMaxPending; ++i) { iPending[i].iUsed = EFalse; }
               iOneShotScan = -1;
               ComputeLayout();
+              caplog("Container: ActivateL");
               ActivateL();
+              caplog_i("Container: window width", Size().iWidth);
+              caplog_i("Container: window height", Size().iHeight);
               iStartCb = new (ELeave) CAsyncCallBack(TCallBack(StartCb, this), CActive::EPriorityLow);
               iStartCb->CallBack();
               }
@@ -794,14 +820,17 @@ jobs:
           void CCapContainer::RunEmulator()
               {
               iStarted = ETrue;
+              caplog("RunEmulator: PrepareStorage");
               TFileName base;
               PrepareStorage(base);
+              { TBuf8<KMaxFileName> b8log; b8log.Copy(base); b8log.Append(TChar(0)); caplog_s("RunEmulator: base folder", (const char*)b8log.Ptr()); }
 
               TFileName romCheck(base); romCheck.Append(_L("rom\\cpc6128.rom"));
               RFs fs; fs.Connect();
               TEntry re;
               TBool haveRom = (fs.Entry(romCheck, re) == KErrNone);
               fs.Close();
+              caplog_i("RunEmulator: cpc6128.rom present", (int)haveRom);
               if (!haveRom)
                   {
                   TFileName m(_L("Copy the CPC ROM files (cpc6128.rom, amsdos.rom ...) to "));
@@ -833,7 +862,11 @@ jobs:
               if (best.Length() > 0) { ToNarrow(best, argSlot, sizeof(argSlot)); argv[argc++] = argSlot; }
               argv[argc] = 0;
 
+              for (TInt i = 0; i < argc; ++i) { caplog_s("RunEmulator: arg", argv[i]); }
+              caplog_mem("before core");
+              caplog("RunEmulator: cap32_main_c");
               cap32_main_c(argc, argv);
+              caplog("RunEmulator: cap32_main_c returned");
               User::Exit(0);
               }
 
@@ -857,10 +890,13 @@ jobs:
               if (iWait.IsStarted()) { iWait.AsyncStop(); }
               }
 
+          extern "C" unsigned int plat_ticks(void);
+
           void CCapContainer::Pump(TInt aMs)
               {
               FlushPending();
               if (iPumping) { return; }
+              TUint pumpStart = plat_ticks();
               for (;;)
                   {
                   iPumping = ETrue;
@@ -879,6 +915,7 @@ jobs:
                   if (iForeground || iQuit) { break; }
                   aMs = 100;               // in the background: freeze the emulator until we come back
                   }
+              iPumpAcc += plat_ticks() - pumpStart;
               }
 
           // ------------------------------------------------------------------ frame presentation
@@ -897,10 +934,12 @@ jobs:
                   TUint period = now - iLastFrameTick;
                   if (period > 200) { period = 200; }
                   iFramePeriod16 = iFramePeriod16 ? (iFramePeriod16 * 3 + period * 16) / 4 : period * 16;
+                  TUint pm = iPumpAcc > 200 ? 200 : iPumpAcc;
+                  iPumpMs16 = iPumpMs16 ? (iPumpMs16 * 3 + pm * 16) / 4 : pm * 16;
                   }
               iLastFrameTick = now;
-              if (!iDirty && iFramePeriod16 > 22 * 16 && iSkipRun < 2) { ++iSkipRun; return; }
-              iSkipRun = 0;
+              iPumpAcc = 0;
+              { static TUint hb = 0; if ((++hb % 250) == 0) { caplog_heartbeat(hb); } }
               ++iWinShown;
               TUint t0 = plat_ticks();
               if (iGlState == 0) { TryInitGl(); }
@@ -911,8 +950,9 @@ jobs:
               iDrawMs16 = iDrawMs16 ? (iDrawMs16 * 3 + dt * 16) / 4 : dt * 16;
               if (iWinTotal >= 30)
                   {
-                  // T = ms between emulated frames (20 = full speed), D = ms to show one frame, S = frames shown out of 30
-                  iDbg.Format(_L("T%u D%u S%u"), (iFramePeriod16 + 8) / 16, (iDrawMs16 + 8) / 16, iWinShown);
+                  // per shown frame, in ms: T = time between shown frames, P = spent in Pump() (waiting for the scheduler,
+                  // delays), D = uploading + drawing + swapping the picture; T - P - D = the emulator core itself
+                  iDbg.Format(_L("T%u P%u D%u"), (iFramePeriod16 + 8) / 16, (iPumpMs16 + 8) / 16, (iDrawMs16 + 8) / 16);
                   iWinTotal = 0; iWinShown = 0;
                   iOverlayDirty = ETrue;
                   }
@@ -1436,6 +1476,7 @@ jobs:
           #include <f32file.h>
           #include <hal.h>
           #include <string.h>
+          #include "cap32_log.h"
 
           extern "C" {
           char* getcwd(char*, unsigned int);
@@ -1488,8 +1529,23 @@ jobs:
 
           extern "C" {
 
-          void* plat_alloc(unsigned int n) { return User::Alloc((TInt)n); }
-          void* plat_realloc(void* p, unsigned int n) { return User::ReAlloc(p, (TInt)n); }
+          static void NoteAllocFail(const char* aWhat, unsigned int n)
+              {
+              static int reported = 0;
+              if (reported < 10) { ++reported; caplog_i(aWhat, (int)n); caplog_mem("after failed allocation"); }
+              }
+          void* plat_alloc(unsigned int n)
+              {
+              void* p = User::Alloc((TInt)n);
+              if (!p) { NoteAllocFail("OUT OF MEMORY: alloc of bytes", n); }
+              return p;
+              }
+          void* plat_realloc(void* p, unsigned int n)
+              {
+              void* q = User::ReAlloc(p, (TInt)n);
+              if (!q) { NoteAllocFail("OUT OF MEMORY: realloc to bytes", n); }
+              return q;
+              }
           void plat_free(void* p) { User::Free(p); }
 
           int plat_open(const char* path, int mode)
@@ -1633,7 +1689,12 @@ jobs:
               return s.Int();
               }
 
-          void plat_exit(int code) { User::Exit(code); }
+          void plat_exit(int code)
+              {
+              caplog_i("plat_exit (core asked to terminate), code", code);
+              caplog_mem("at exit");
+              User::Exit(code);
+              }
 
           double plat_pow(double a, double b) { TReal r = 0; Math::Pow(r, a, b); return r; }
           double plat_sin(double a) { TReal r = 0; Math::Sin(r, a); return r; }
@@ -3322,6 +3383,7 @@ jobs:
           cat > symbian/app/src/cap32_gl.cpp <<'CAP32_EOF'
           // cap32_gl.cpp - OpenGL ES 2 output for the Symbian^3 front end.
           #include "cap32_gl.h"
+          #include "cap32_log.h"
 
           // Minimal EGL / OpenGL ES 2.0 declarations: the SDK headers are not on this build's include path.
           extern "C" {
@@ -3341,6 +3403,7 @@ jobs:
           EGLBoolean eglSwapBuffers(EGLDisplay aDpy, EGLSurface aSurf);
           EGLBoolean eglDestroySurface(EGLDisplay aDpy, EGLSurface aSurf);
           EGLBoolean eglDestroyContext(EGLDisplay aDpy, EGLContext aCtx);
+          EGLint eglGetError(void);
           }
 
           typedef unsigned int GLenum;
@@ -3383,6 +3446,9 @@ jobs:
           void glUseProgram(GLuint aProg);
           void glVertexAttribPointer(GLuint aIndex, GLint aSize, GLenum aType, GLboolean aNorm, GLsizei aStride, const GLvoid* aPtr);
           void glViewport(GLint aX, GLint aY, GLsizei aW, GLsizei aH);
+          const unsigned char* glGetString(GLenum aName);
+          void glGetShaderInfoLog(GLuint aShader, GLsizei aMax, GLsizei* aLen, GLchar* aLog);
+          void glGetProgramInfoLog(GLuint aProg, GLsizei aMax, GLsizei* aLen, GLchar* aLog);
           }
 
           static const GLenum kTex2D = 0x0DE1, kMinF = 0x2801, kMagF = 0x2800, kWrapS = 0x2802, kWrapT = 0x2803;
@@ -3418,7 +3484,14 @@ jobs:
               glCompileShader(sh);
               GLint ok = 0;
               glGetShaderiv(sh, kCompileStatus, &ok);
-              if (!ok) { glDeleteShader(sh); return 0; }
+              if (!ok)
+                  {
+                  char log[200]; GLsizei n = 0; log[0] = 0;
+                  glGetShaderInfoLog(sh, 199, &n, log); log[n > 0 && n < 200 ? n : 0] = 0;
+                  caplog_s("GL: shader compile failed", log);
+                  glDeleteShader(sh);
+                  return 0;
+                  }
               return sh;
               }
 
@@ -3448,30 +3521,58 @@ jobs:
 
           int cgl_init(void* aNativeWindow, int aW, int aH)
               {
+              caplog("GL: eglGetDisplay");
               gDpy = eglGetDisplay(0);
-              if (!gDpy) { return 0; }
+              caplog_x("GL: display", (unsigned int)(unsigned long)gDpy);
+              if (!gDpy) { caplog_x("GL: eglGetDisplay failed, error", (unsigned int)eglGetError()); return 0; }
+              caplog("GL: eglInitialize");
               EGLint maj = 0, min = 0;
-              if (!eglInitialize(gDpy, &maj, &min)) { gDpy = 0; return 0; }
+              if (!eglInitialize(gDpy, &maj, &min)) { caplog_x("GL: eglInitialize failed, error", (unsigned int)eglGetError()); gDpy = 0; return 0; }
+              caplog_i("GL: EGL major", maj);
+              caplog_i("GL: EGL minor", min);
               const EGLint attr[] = { 0x3033 /*SURFACE_TYPE*/, 0x0004 /*WINDOW_BIT*/,
                                       0x3040 /*RENDERABLE_TYPE*/, 0x0004 /*OPENGL_ES2_BIT*/, 0x3038 /*NONE*/ };
               const EGLint ctxAttr[] = { 0x3098 /*CONTEXT_CLIENT_VERSION*/, 2, 0x3038 };
               EGLConfig cfg[24];
               EGLint n = 0;
-              if (!eglChooseConfig(gDpy, attr, cfg, 24, &n) || n < 1) { DestroyEgl(); return 0; }
+              caplog("GL: eglChooseConfig");
+              if (!eglChooseConfig(gDpy, attr, cfg, 24, &n) || n < 1)
+                  {
+                  caplog_x("GL: no usable EGL config, error", (unsigned int)eglGetError());
+                  caplog_i("GL: configs found", n);
+                  DestroyEgl();
+                  return 0;
+                  }
+              caplog_i("GL: configs found", n);
               // the first configs may not match the window's pixel format: try them until one gives a surface + context
               for (EGLint i = 0; i < n && !gCtx; ++i)
                   {
+                  caplog_i("GL: trying config", i);
+                  caplog("GL: eglCreateWindowSurface");
                   EGLSurface sf = eglCreateWindowSurface(gDpy, cfg[i], aNativeWindow, 0);
-                  if (!sf) { continue; }
+                  if (!sf) { caplog_x("GL: surface failed, error", (unsigned int)eglGetError()); continue; }
+                  caplog("GL: eglCreateContext");
                   EGLContext cx = eglCreateContext(gDpy, cfg[i], 0, ctxAttr);
-                  if (!cx) { eglDestroySurface(gDpy, sf); continue; }
-                  if (!eglMakeCurrent(gDpy, sf, sf, cx)) { eglDestroyContext(gDpy, cx); eglDestroySurface(gDpy, sf); continue; }
+                  if (!cx) { caplog_x("GL: context failed, error", (unsigned int)eglGetError()); eglDestroySurface(gDpy, sf); continue; }
+                  caplog("GL: eglMakeCurrent");
+                  if (!eglMakeCurrent(gDpy, sf, sf, cx))
+                      {
+                      caplog_x("GL: MakeCurrent failed, error", (unsigned int)eglGetError());
+                      eglDestroyContext(gDpy, cx); eglDestroySurface(gDpy, sf);
+                      continue;
+                      }
                   gSurf = sf; gCtx = cx;
                   }
-              if (!gCtx) { DestroyEgl(); return 0; }
+              if (!gCtx) { caplog("GL: no config gave a surface + context"); DestroyEgl(); return 0; }
+              caplog_s("GL vendor", (const char*)glGetString(0x1F00));
+              caplog_s("GL renderer", (const char*)glGetString(0x1F01));
+              caplog_s("GL version", (const char*)glGetString(0x1F02));
+              caplog_s("GL shading language", (const char*)glGetString(0x8B8C));
 
+              caplog("GL: compiling shaders");
               GLuint vs = CompileShader(kVertexShader, kVS), fs = CompileShader(kFragmentShader, kFS);
-              if (!vs || !fs) { DestroyEgl(); return 0; }
+              if (!vs || !fs) { caplog("GL: shaders failed"); DestroyEgl(); return 0; }
+              caplog("GL: linking program");
               gProg = glCreateProgram();
               glAttachShader(gProg, vs);
               glAttachShader(gProg, fs);
@@ -3482,15 +3583,24 @@ jobs:
               glGetProgramiv(gProg, kLinkStatus, &ok);
               glDeleteShader(vs);
               glDeleteShader(fs);
-              if (!ok) { glDeleteProgram(gProg); gProg = 0; DestroyEgl(); return 0; }
+              if (!ok)
+                  {
+                  char log[200]; GLsizei ln = 0; log[0] = 0;
+                  glGetProgramInfoLog(gProg, 199, &ln, log); log[ln > 0 && ln < 200 ? ln : 0] = 0;
+                  caplog_s("GL: program link failed", log);
+                  glDeleteProgram(gProg); gProg = 0; DestroyEgl();
+                  return 0;
+                  }
               gLocTex = glGetUniformLocation(gProg, "uTex");
               gLocKey = glGetUniformLocation(gProg, "uKey");
+              caplog("GL: textures");
               gTexFrame = MakeTexture(0x2601 /*LINEAR*/);
               gTexOvl = MakeTexture(kNearest);
               glEnableVertexAttribArray(0);
               glEnableVertexAttribArray(1);
               glViewport(0, 0, aW, aH);
               gFrameW = gFrameH = gOvlW = gOvlH = 0;
+              caplog("GL: initialised");
               return 1;
               }
 
@@ -3568,9 +3678,239 @@ jobs:
                   glUniform1f(gLocKey, 1.0f);
                   Quad(-1.0f, 1.0f, 1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f);
                   }
-              return eglSwapBuffers(gDpy, gSurf) ? 1 : 0;
+              if (eglSwapBuffers(gDpy, gSurf)) { return 1; }
+              caplog_x("GL: eglSwapBuffers failed, error", (unsigned int)eglGetError());
+              return 0;
               }
 
+          CAP32_EOF
+          cat > symbian/app/inc/cap32_log.h <<'CAP32_EOF'
+          // cap32_log.h - crash-proof log file for real devices (written and flushed line by line).
+          #ifndef CAP32_LOG_H
+          #define CAP32_LOG_H
+          extern "C" {
+          void caplog_start(void);                                  // open the log, dump device info, install the exception handler
+          void caplog(const char* aMsg);                            // one line (flushed immediately)
+          void caplog_s(const char* aLabel, const char* aStr);      // "label: str"
+          void caplog_i(const char* aMsg, int aVal);                // "msg: 123"
+          void caplog_x(const char* aMsg, unsigned int aVal);       // "msg: 0x1F"
+          void caplog_fast(const char* aMsg);                       // remember only (cheap, for hot paths); dumped on a crash
+          void caplog_mem(const char* aTag);                        // heap and free RAM
+          void caplog_heartbeat(unsigned int aFrames);              // "still alive" + memory, call now and then
+          }
+          #endif
+          CAP32_EOF
+          cat > symbian/app/src/cap32_log.cpp <<'CAP32_EOF'
+          // cap32_log.cpp - crash-proof log file for real devices (Nokia C7 etc.).
+          // Every line is written and flushed immediately, so after a crash the last line shows how far the app got.
+          // The previous run's log is kept as cap32_log_prev.txt.  Location: E:\caprice32\, else F:\caprice32\,
+          // else C:\Data\caprice32\ (the first one that works).
+          #include <e32base.h>
+          #include <e32std.h>
+          #include <f32file.h>
+          #include <hal.h>
+          #include <string.h>
+          #include "cap32_log.h"
+
+          static RFs gFs;
+          static RFile gFile;
+          static TBool gTried = EFalse;
+          static TBool gOpen = EFalse;
+          static TUint gStart = 0;
+          static TInt gLines = 0;
+          static const char* gFast = NULL;
+          static char gLast[100];
+          static TFileName gPath;
+
+          static void OpenLog()
+              {
+              if (gTried) { return; }
+              gTried = ETrue;
+              gStart = User::NTickCount();
+              gLast[0] = 0;
+              if (gFs.Connect() != KErrNone) { return; }
+              _LIT(KD1, "E:\\caprice32\\");
+              _LIT(KD2, "F:\\caprice32\\");
+              _LIT(KD3, "C:\\Data\\caprice32\\");
+              const TDesC* dirs[3] = { &KD1(), &KD2(), &KD3() };
+              for (TInt i = 0; i < 3 && !gOpen; ++i)
+                  {
+                  TInt e = gFs.MkDirAll(*dirs[i]);
+                  if (e != KErrNone && e != KErrAlreadyExists) { continue; }
+                  TFileName cur(*dirs[i]); cur.Append(_L("cap32_log.txt"));
+                  TFileName prev(*dirs[i]); prev.Append(_L("cap32_log_prev.txt"));
+                  gFs.Replace(cur, prev);                         // keep the previous run (ignore errors)
+                  if (gFile.Replace(gFs, cur, EFileWrite | EFileShareAny) == KErrNone)
+                      {
+                      gOpen = ETrue;
+                      gPath = cur;
+                      }
+                  }
+              }
+
+          static void Put(const TDesC8& aLine)
+              {
+              if (!gOpen) { return; }
+              gFile.Write(aLine);
+              gFile.Flush();
+              }
+
+          static void Head(TDes8& aLine)
+              {
+              aLine.Append('[');
+              aLine.AppendNum((TInt)(User::NTickCount() - gStart));
+              aLine.Append(_L8("ms] "));
+              }
+
+          static void AppendText(TDes8& aLine, const char* aStr)
+              {
+              if (!aStr) { aStr = "(null)"; }
+              TInt n = (TInt)strlen(aStr);
+              if (n > 200) { n = 200; }
+              aLine.Append(TPtrC8((const TUint8*)aStr, n));
+              }
+
+          static void Remember(const char* aMsg)
+              {
+              if (!aMsg) { return; }
+              TInt n = (TInt)strlen(aMsg);
+              if (n > (TInt)sizeof(gLast) - 1) { n = (TInt)sizeof(gLast) - 1; }
+              Mem::Copy(gLast, aMsg, n);
+              gLast[n] = 0;
+              }
+
+          extern "C" {
+
+          void caplog(const char* aMsg)
+              {
+              OpenLog();
+              Remember(aMsg);
+              if (!gOpen) { return; }
+              if (gLines > 800)                                    // a runaway checkpoint must not fill the card
+                  {
+                  if (gLines == 801) { ++gLines; Put(_L8("--- log truncated ---\r\n")); }
+                  return;
+                  }
+              ++gLines;
+              TBuf8<300> l;
+              Head(l);
+              AppendText(l, aMsg);
+              l.Append(_L8("\r\n"));
+              Put(l);
+              }
+
+          void caplog_s(const char* aLabel, const char* aStr)
+              {
+              OpenLog();
+              if (!gOpen) { return; }
+              TBuf8<300> l;
+              Head(l);
+              AppendText(l, aLabel);
+              l.Append(_L8(": "));
+              AppendText(l, aStr);
+              l.Append(_L8("\r\n"));
+              Put(l);
+              }
+
+          void caplog_i(const char* aMsg, int aVal)
+              {
+              OpenLog();
+              if (!gOpen) { return; }
+              TBuf8<300> l;
+              Head(l);
+              AppendText(l, aMsg);
+              l.Append(_L8(": "));
+              l.AppendNum((TInt)aVal);
+              l.Append(_L8("\r\n"));
+              Put(l);
+              }
+
+          void caplog_x(const char* aMsg, unsigned int aVal)
+              {
+              OpenLog();
+              if (!gOpen) { return; }
+              TBuf8<300> l;
+              Head(l);
+              AppendText(l, aMsg);
+              l.Append(_L8(": 0x"));
+              l.AppendNumUC((TUint)aVal, EHex);
+              l.Append(_L8("\r\n"));
+              Put(l);
+              }
+
+          void caplog_fast(const char* aMsg) { gFast = aMsg; }
+
+          void caplog_mem(const char* aTag)
+              {
+              OpenLog();
+              if (!gOpen) { return; }
+              RHeap& h = User::Heap();
+              TInt big = 0;
+              TInt avail = h.Available(big);
+              TInt ramFree = 0;
+              HAL::Get(HALData::EMemoryRAMFree, ramFree);
+              TBuf8<300> l;
+              Head(l);
+              l.Append(_L8("mem "));
+              AppendText(l, aTag);
+              l.Append(_L8(": heap size="));  l.AppendNum(h.Size());
+              l.Append(_L8(" max="));         l.AppendNum(h.MaxLength());
+              l.Append(_L8(" free="));        l.AppendNum(avail);
+              l.Append(_L8(" biggest="));     l.AppendNum(big);
+              l.Append(_L8(" ram free="));    l.AppendNum(ramFree);
+              l.Append(_L8("\r\n"));
+              Put(l);
+              }
+
+          void caplog_heartbeat(unsigned int aFrames)
+              {
+              OpenLog();
+              if (!gOpen) { return; }
+              TBuf8<80> l;
+              Head(l);
+              l.Append(_L8("alive, shown frames="));
+              l.AppendNum((TInt)aFrames);
+              l.Append(_L8("\r\n"));
+              Put(l);
+              caplog_mem("heartbeat");
+              }
+
+          static void ExcHandler(TExcType aType)
+              {
+              caplog_i("*** EXCEPTION, TExcType", (int)aType);
+              caplog_s("*** last fast checkpoint", gFast);
+              caplog_s("*** last logged line", gLast);
+              caplog_mem("at exception");
+              }
+
+          void caplog_start(void)
+              {
+              OpenLog();
+              if (!gOpen) { return; }
+              TBuf8<260> p;
+              Head(p);
+              p.Append(_L8("cap32 log, file "));
+              TBuf8<KMaxFileName> path8;
+              path8.Copy(gPath);                                  // narrow the file name
+              p.Append(path8);
+              p.Append(_L8("\r\n"));
+              Put(p);
+              caplog_s("build", __DATE__ " " __TIME__);
+              TVersion v = User::Version();
+              caplog_i("OS version major", v.iMajor);
+              caplog_i("OS version minor", v.iMinor);
+              caplog_i("OS build", v.iBuild);
+              TInt x = 0;
+              if (HAL::Get(HALData::EMachineUid, x) == KErrNone) { caplog_x("machine uid", (unsigned int)x); }
+              if (HAL::Get(HALData::EMemoryRAM, x) == KErrNone) { caplog_i("ram total", x); }
+              if (HAL::Get(HALData::ECPUSpeed, x) == KErrNone) { caplog_i("cpu speed kHz", x); }
+              caplog_mem("start");
+              User::SetExceptionHandler(ExcHandler, KExceptionAbort | KExceptionKill | KExceptionUserInterrupt
+                                                    | KExceptionFpe | KExceptionInteger);
+              caplog("exception handler installed");
+              }
+
+          }
           CAP32_EOF
           cat > symbian/group_app/bld.inf <<'CAP32_EOF'
           PRJ_PLATFORMS
@@ -3599,6 +3939,7 @@ jobs:
           SOURCE          cap32_audio.cpp
           SOURCE          cap32_container.cpp
           SOURCE          cap32_gl.cpp
+          SOURCE          cap32_log.cpp
           SOURCE          plat_symbian.cpp
 
           USERINCLUDE     ../app/inc
@@ -3679,16 +4020,22 @@ jobs:
           set -e
           mkdir -p symbian/overrides
           cat > symbian/overrides/crashlog.h <<'CAP32_EOF'
-          // Crash logging is not available on Symbian: no-op replacement for src/crashlog.h.
+          // Crash logging for Symbian: breadcrumbs go to the device log (cap32_log.cpp).  checkpoint() is written to the
+          // file at once; checkpoint_fast() only remembers the text (cheap) and is dumped when an exception happens.
+          // The per-instruction macros (CRASHLOG_FAST, CRASHLOG_SET_PC) stay empty: they sit in the Z80 hot path.
           #ifndef CRASHLOG_H
           #define CRASHLOG_H
-          namespace crashlog {
-          inline void init() {}
-          inline void checkpoint(const char*) {}
-          inline void checkpoint_fast(const char*) {}
+          extern "C" {
+          void caplog(const char* aMsg);
+          void caplog_fast(const char* aMsg);
           }
-          #define CRASH_CHECKPOINT(msg) ((void)0)
-          #define CRASH_CHECKPOINT_FAST(msg) ((void)0)
+          namespace crashlog {
+          inline void init() { caplog("core: crashlog init"); }
+          inline void checkpoint(const char* m) { caplog(m); }
+          inline void checkpoint_fast(const char* m) { caplog_fast(m); }
+          }
+          #define CRASH_CHECKPOINT(msg) (::caplog(msg))
+          #define CRASH_CHECKPOINT_FAST(msg) (::caplog_fast(msg))
           #define CRASHLOG_FAST(msg) ((void)0)
           #define CRASHLOG_SET_PC(pc) ((void)0)
           #endif
@@ -4085,6 +4432,9 @@ jobs:
           mkdir -p symbian/tools/host
           cat > symbian/tools/host/plat_host.cpp <<'CAP32_EOF'
           // Host smoke-test backend (uses real glibc; compiled WITHOUT compat headers)
+          // The device crash log (cap32_log.cpp) does not exist on the host: breadcrumbs are dropped.
+          extern "C" void caplog(const char*) {}
+          extern "C" void caplog_fast(const char*) {}
           #include <dlfcn.h>
           #include <stdio.h>
           #include <stdlib.h>
