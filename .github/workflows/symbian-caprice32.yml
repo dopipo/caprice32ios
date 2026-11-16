@@ -3957,12 +3957,10 @@ jobs:
               TBuf8<160> raw;
               TInt err = KErrGeneral;
               th.Suspend();
-              const TInt lens[4] = { 68, 72, 76, 128 };
-              for (TInt i = 0; i < 4 && err != KErrNone; ++i)
-                  {
-                  raw.SetLength(lens[i]);
-                  err = th.Context(raw);
-                  }
+              // RThread::Context() returns void on Symbian^3 and sets the length of the descriptor itself
+              raw.SetLength(0);
+              th.Context(raw);
+              if (raw.Length() >= 68) { err = KErrNone; }
               TUint32 words[64];
               TInt nWords = 0;
               TUint32 pc = 0, lr = 0, sp = 0, cpsr = 0;
@@ -4004,17 +4002,12 @@ jobs:
               TInt count = 0;
               while (fl.Next(name) == KErrNone && count < 150)
                   {
-                  RLibrary lib;
-                  if (lib.Open(fl) != KErrNone) { continue; }
-                  TUint32 a1 = (TUint32)lib.Lookup(1);
-                  lib.Close();
+                  // RLibrary has no Open(TFindLibrary&) on Symbian^3, so only the module names are logged
                   TBuf8<200> b;
                   b.Append(_L8("lib "));
                   TBuf8<120> n8;
                   n8.Copy(name.Left(100));
                   b.Append(n8);
-                  b.Append(_L8(" ordinal1 at "));
-                  WdHex(b, a1);
                   WdPut(aF, b);
                   ++count;
                   }
