@@ -145,6 +145,7 @@ jobs:
               TBool CanWrite();
               TBool Write(const TUint8* aData, TInt aLen);
               void Pause(TBool aPaused);
+              TUint Info() const;
 
               void MaoscOpenComplete(TInt aError);
               void MaoscBufferCopied(TInt aError, const TDesC8& aBuffer);
@@ -221,6 +222,7 @@ jobs:
               void OnRelease(TInt aHit, TPointerState& aState);
               void ShowMessage(const TDesC& aMsg);
               void FlushPending();
+              void DbgSync(TBool aBgLoop);
               TInt KeyboardRowCount() const;
               TRect KeyRect(TInt aRow, TInt aStartUnits, TInt aWidthUnits, TInt aRowUnits) const;
               TBool MapSymbianKey(TInt aScanCode, TInt& aScan, TInt& aSym) const;
@@ -571,6 +573,15 @@ jobs:
               }
 
           void CCapAudio::Pause(TBool aPaused) { iPaused = aPaused; }
+
+          // b0 ready, b1 failed, b2 paused, b4..b7 busy slots, b16..b31 ms since the stream last returned/queued a buffer
+          TUint CCapAudio::Info() const
+              {
+              TUint busy = 0;
+              for (TInt i = 0; i < KSlots; ++i) { if (iBusy[i]) { ++busy; } }
+              TUint idle = lite_ticks() - iLastAct; if (idle > 0xFFFF) { idle = 0xFFFF; }
+              return (iReady ? 1u : 0u) | (iFailed ? 2u : 0u) | (iPaused ? 4u : 0u) | (busy << 4) | (idle << 16);
+              }
 
           // ---- hooks used by the core ----
           extern "C" int lite_audio_open(int freq, int channels, int bits, int samples)
@@ -936,6 +947,9 @@ jobs:
 
           void CCapContainer::SetForeground(TBool aForeground)
               {
+              caplog_i("Container: SetForeground", (int)aForeground);
+              caplog_i("Container: SetForeground, emulator started", (int)iStarted);
+              caplog_i("Container: SetForeground, GL state", (int)iGlState);
               iForeground = aForeground;
               if (iStarted) { lite_post_window(aForeground ? 12 : 13); }
               if (aForeground) { Refresh(); }
@@ -967,9 +981,14 @@ jobs:
                       gHbTick = t;
                       caplog_i("alive: presented frames", (int)gPresents);
                       caplog_i("alive: pumps", (int)gPumps);
+                      caplog_x("alive: state flags (b0 fg,b1 pumping,b2 GL,b3 started,b4 bgloop,b5 menu,b6 kbd)", gDbgFlags);
+                      caplog_x("alive: audio info (b0 ready,b1 failed,b2 paused,b4-7 busy slots,b16+ ms idle)", gDbgAudio);
                       }
               }
               TUint pumpStart = plat_ticks();
+              TUint bgStart = 0, bgLog = 0;
+              gDbgPumpTick = User::NTickCount();
+              DbgSync(EFalse);
               for (;;)
                   {
                   iPumping = ETrue;
@@ -988,7 +1007,23 @@ jobs:
                   iWait.Start();
                   iPumping = EFalse;
                   caplog_fast("Pump: returned");
-                  if (iForeground || iQuit) { break; }
+                  if (iForeground || iQuit)
+                      {
+                      if (bgStart) { caplog_i("Pump: LEFT the background loop after ms", (int)(plat_ticks() - bgStart)); }
+                      break;
+                      }
+                  if (!bgStart)
+                      {
+                      bgStart = plat_ticks(); bgLog = bgStart;
+                      DbgSync(ETrue);
+                      caplog_i("Pump: ENTERED the background loop (emulator frozen), iStarted", (int)iStarted);
+                      }
+                  else if (plat_ticks() - bgLog >= 5000)
+                      {
+                      bgLog = plat_ticks();
+                      DbgSync(ETrue);
+                      caplog_i("Pump: STILL in the background loop, ms", (int)(bgLog - bgStart));
+                      }
                   aMs = 100;               // in the background: freeze the emulator until we come back
                   }
               iPumpAcc += plat_ticks() - pumpStart;
@@ -999,7 +1034,14 @@ jobs:
 
           void CCapContainer::Present(const TUint32* aPix, TInt aW, TInt aH, TInt aPitch, const TRect& aSrc)
               {
-              if (!iForeground) { return; }
+              if (!iForeground)
+                  {
+                  static TUint skipped = 0;
+                  ++skipped;
+                  if (skipped == 1 || (skipped % 200) == 0) { caplog_i("Present: SKIPPED, app marked background, count", (int)skipped); }
+                  return;
+                  }
+              gDbgPresentTick = User::NTickCount();
               // Adaptive frame skip. A CPC frame is 20 ms; when emulated frames arrive slower than that, the machine is
               // running below real time, so drop the copy + stretch + overlay redraw of up to 2 frames in 3. That time goes
               // back to the emulation; as soon as it keeps up again every frame is shown.
@@ -1217,6 +1259,13 @@ jobs:
               lite_post_key(0, aScan, aSym, aMod);
               }
 
+          void CCapContainer::DbgSync(TBool aBgLoop)
+              {
+              gDbgFlags = (iForeground ? 1u : 0u) | (iPumping ? 2u : 0u) | (iGlState == 1 ? 4u : 0u) | (iStarted ? 8u : 0u)
+                        | (aBgLoop ? 16u : 0u) | (iMenu ? 32u : 0u) | (iKeyboard ? 64u : 0u);
+              gDbgAudio = gCapAudio ? gCapAudio->Info() : 0;
+              }
+
           void CCapContainer::FlushPending()
               {
               TUint now = lite_ticks();
@@ -1265,7 +1314,16 @@ jobs:
 
           TKeyResponse CCapContainer::OfferKeyEventL(const TKeyEvent& aKeyEvent, TEventCode aType)
               {
+              if (!iForeground)
+                  {
+                  // Input only reaches a window that has the focus, so the app IS in front.  A lost "foreground gained" event
+                  // would otherwise leave the emulator frozen in the background loop of Pump(): black picture, dead buttons.
+                  caplog("Input while marked background: forcing foreground");
+                  iForeground = ETrue;
+                  if (iStarted) { lite_post_window(12); }
+                  }
               TInt sc = aKeyEvent.iScanCode;
+              gDbgInputTick = User::NTickCount();
               if (aType == EEventKeyDown) { caplog_i("key down, scan code", sc); }
               if (aType == EEventKey) { return EKeyWasConsumed; }
               if (aType != EEventKeyDown && aType != EEventKeyUp) { return EKeyWasNotConsumed; }
@@ -1422,6 +1480,25 @@ jobs:
 
           void CCapContainer::HandlePointerEventL(const TPointerEvent& aEvent)
               {
+              gDbgInputTick = User::NTickCount();
+              {
+                  static TInt shown = 0;
+                  if (aEvent.iType == TPointerEvent::EButton1Down && shown < 40)
+                      {
+                      ++shown;
+                      caplog_i("Pointer down x", aEvent.iPosition.iX);
+                      caplog_i("Pointer down y", aEvent.iPosition.iY);
+                      caplog_i("Pointer down, iPumping", (int)iPumping);
+                      }
+              }
+              if (!iForeground)
+                  {
+                  // Input only reaches a window that has the focus, so the app IS in front.  A lost "foreground gained" event
+                  // would otherwise leave the emulator frozen in the background loop of Pump(): black picture, dead buttons.
+                  caplog("Input while marked background: forcing foreground");
+                  iForeground = ETrue;
+                  if (iStarted) { lite_post_window(12); }
+                  }
               TInt n = 0;
           #if USE_MULTITOUCH
               if (aEvent.IsAdvancedPointerEvent()) { n = const_cast<TPointerEvent&>(aEvent).AdvancedPointerEvent()->PointerNumber(); }
@@ -1509,6 +1586,7 @@ jobs:
               TSize s = Size();
               if (s != iOvlSize)
                   {
+                  caplog("RenderGl: window size changed, GL switched OFF");
                   ShutdownGl();
                   ShowMessage(_L("OpenGL ES 2: screen size changed, restart the app"));
                   return EFalse;
@@ -1518,6 +1596,7 @@ jobs:
               TInt sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
               if (iSrc.Width() > 0 && iSrc.Height() > 0) { sx0 = iSrc.iTl.iX; sy0 = iSrc.iTl.iY; sx1 = iSrc.iBr.iX; sy1 = iSrc.iBr.iY; }
               if (cgl_draw(g.iTl.iX, g.iTl.iY, g.iBr.iX, g.iBr.iY, sx0, sy0, sx1, sy1, s.iWidth, s.iHeight)) { return ETrue; }
+              caplog("RenderGl: cgl_draw failed (eglSwapBuffers error above), GL switched OFF -> black picture");
               ShutdownGl();
               ShowMessage(_L("OpenGL ES 2: presenting failed"));
               return EFalse;
@@ -1770,11 +1849,34 @@ jobs:
 
           extern "C" void lite_app_teardown(void);
 
+          // Exit reaper: on Symbian^3 eglDestroyContext/eglTerminate can block forever in the GPU driver (worst when the
+          // app has just lost the foreground), which leaves a dead app on screen.  A second thread gives teardown a fixed
+          // time and then kills the whole process, which makes the kernel release the GPU/audio resources itself.
+          static TInt ReaperMain(TAny*)
+              {
+              User::After(TTimeIntervalMicroSeconds32(2500000));
+              caplog("EXIT: reaper: teardown did not finish in 2.5 s, killing the process");
+              RProcess().Kill(0);
+              return 0;
+              }
+
+          static void StartReaper()
+              {
+              RThread t;
+              if (t.Create(_L("cap32reap"), ReaperMain, 0x2000, 0x2000, 0x10000, NULL) == KErrNone)
+                  {
+                  t.SetPriority(EPriorityMore);
+                  t.Resume();
+                  t.Close();
+                  }
+              }
+
           void plat_exit(int code)
               {
               static int sExiting = 0;
               if (sExiting) { User::Exit(code); }     // re-entered (abort/exit during teardown): just go
               sExiting = 1;
+              StartReaper();
               caplog_i("EXIT: plat_exit (core asked to terminate), code", code);
               caplog_mem("at exit");
               lite_app_teardown();
@@ -3803,6 +3905,9 @@ jobs:
           void caplog_mem(const char* aTag);                        // heap and free RAM
           void caplog_heartbeat(unsigned int aFrames);              // "still alive" + memory, call now and then
           void caplog_progress(void);                               // "the main thread is making progress" (feeds the watchdog)
+          // live state snapshot, written by the UI code and printed by the watchdog thread in every "STATE" line
+          extern volatile unsigned int gDbgFlags;   // b0 foreground, b1 pumping, b2 GL on, b3 emulator started, b4 in background loop, b5 menu, b6 keyboard
+          extern volatile unsigned int gDbgPresentTick, gDbgPumpTick, gDbgInputTick, gDbgAudio;
           unsigned int caplog_ticks(void);                          // milliseconds, for timing
           }
           #endif
@@ -3829,6 +3934,7 @@ jobs:
           static char gLast[100];
           static TFileName gPath;
           static TFileName gDir;                  // folder of the log
+          volatile unsigned int gDbgFlags = 0, gDbgPresentTick = 0, gDbgPumpTick = 0, gDbgInputTick = 0, gDbgAudio = 0;
           static volatile TUint gProgress = 0;    // incremented by the main thread while it is alive
 
           static void OpenLog()
@@ -4098,6 +4204,19 @@ jobs:
                   }
               }
 
+          static void WdState(RFile& aF)
+              {
+              TUint now = User::NTickCount();
+              TBuf8<300> b;
+              b.Append(_L8("STATE flags=")); WdHex(b, gDbgFlags);
+              b.Append(_L8(" (b0 fg,b1 pumping,b2 GL,b3 started,b4 bgloop,b5 menu,b6 kbd)"));
+              b.Append(_L8(" ms since: present=")); b.AppendNum(gDbgPresentTick ? (TInt)(now - gDbgPresentTick) : -1);
+              b.Append(_L8(" pump=")); b.AppendNum(gDbgPumpTick ? (TInt)(now - gDbgPumpTick) : -1);
+              b.Append(_L8(" input=")); b.AppendNum(gDbgInputTick ? (TInt)(now - gDbgInputTick) : -1);
+              b.Append(_L8(" audio=")); WdHex(b, gDbgAudio);
+              WdPut(aF, b);
+              }
+
           static TInt WatchdogMain(TAny*)
               {
               RFile f = gFile;                                    // same file as the main log (one log only)
@@ -4144,6 +4263,8 @@ jobs:
                       }
                   else { User::After(1000000); }
                   ++tick;
+                  if ((tick % 3) == 0 && gDbgPresentTick && (User::NTickCount() - gDbgPresentTick) > 3000 && lines < 400)
+                      { ++lines; WdWrite(f, "NO FRAME PRESENTED for 3+ s while main thread runs, progress", (TInt)gProgress, gFast, gLast); WdState(f); }
                   TUint now = gProgress;
                   if (now == last)
                       {
@@ -4152,6 +4273,7 @@ jobs:
                           {
                           ++lines;
                           WdWrite(f, "NO PROGRESS for seconds", stuck, gFast, gLast);
+                          WdState(f);
                           ++reports;
                           if (reports <= 5)
                               {
@@ -4169,7 +4291,7 @@ jobs:
                       if (stuck >= 3) { WdWrite(f, "recovered after seconds", stuck, gFast, gLast); }
                       stuck = 0;
                       last = now;
-                      if ((tick % 10) == 0 && lines < 400) { ++lines; WdWrite(f, "alive, progress", (TInt)now, gFast, gLast); }
+                      if ((tick % 10) == 0 && lines < 400) { ++lines; WdWrite(f, "alive, progress", (TInt)now, gFast, gLast); WdState(f); }
                       }
                   }
               }
